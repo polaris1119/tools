@@ -63,7 +63,7 @@
 //	PillAspirin // Aspirin
 //
 // to suppress it in the output.
-package main // import "golang.org/x/tools/cmd/stringer"
+package main
 
 import (
 	"bytes"

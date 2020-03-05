@@ -18,7 +18,7 @@ splitdwarf will place it where the OSX tools expect it, in
 creating directories as necessary.
 
 */
-package main // import "golang.org/x/tools/cmd/splitdwarf"
+package main
 
 import (
 	"crypto/sha256"
