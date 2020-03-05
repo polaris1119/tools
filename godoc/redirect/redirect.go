@@ -104,7 +104,7 @@ var redirects = map[string]string{
 	"/issue/new":  "https://github.com/golang/go/issues/new",
 	"/issues":     "https://github.com/golang/go/issues",
 	"/issues/new": "https://github.com/golang/go/issues/new",
-	"/play":       "http://play.golang.org",
+	"/play":       "https://play.studygolang.com",
 	"/design":     "https://go.googlesource.com/proposal/+/master/design",
 
 	// In Go 1.2 the references page is part of /doc/.
@@ -141,7 +141,7 @@ var redirects = map[string]string{
 var prefixHelpers = map[string]string{
 	"issue":  "https://github.com/golang/go/issues/",
 	"issues": "https://github.com/golang/go/issues/",
-	"play":   "http://play.golang.org/",
+	"play":   "https://play.studygolang.org/",
 	"talks":  "http://talks.golang.org/",
 	"wiki":   "https://github.com/golang/go/wiki/",
 }
