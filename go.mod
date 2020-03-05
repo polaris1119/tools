@@ -1,4 +1,4 @@
-module golang.org/x/tools
+module github.com/polaris1119/tools
 
 go 1.11
 
