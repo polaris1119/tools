@@ -75,7 +75,7 @@ Show which clothes (see above) must be donned before a jacket:
 	$ digraph reverse jacket
 
 */
-package main // import "golang.org/x/tools/cmd/digraph"
+package main
 
 // TODO(adonovan):
 // - support input files other than stdin
