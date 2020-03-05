@@ -21,7 +21,7 @@ import (
 	"golang.org/x/tools/godoc/golangorgenv"
 )
 
-const baseURL = "https://play.golang.org"
+const baseURL = "https://play.studygolang.com"
 
 func init() {
 	http.HandleFunc("/compile", bounce)
