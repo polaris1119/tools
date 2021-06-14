@@ -7,24 +7,20 @@ package cache
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/gocommand"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/span"
-	errors "golang.org/x/xerrors"
-)
-
-const (
-	SyntaxError = "syntax"
 )
 
 type parseModHandle struct {
@@ -48,10 +44,9 @@ func (mh *parseModHandle) parse(ctx context.Context, snapshot *snapshot) (*sourc
 }
 
 func (s *snapshot) ParseMod(ctx context.Context, modFH source.FileHandle) (*source.ParsedModule, error) {
-	if handle := s.getModHandle(modFH.URI()); handle != nil {
+	if handle := s.getParseModHandle(modFH.URI()); handle != nil {
 		return handle.parse(ctx, s)
 	}
-
 	h := s.generation.Bind(modFH.FileIdentity(), func(ctx context.Context, _ memoize.Arg) interface{} {
 		_, done := event.Start(ctx, "cache.ParseModHandle", tag.URI.Of(modFH.URI()))
 		defer done()
@@ -65,21 +60,38 @@ func (s *snapshot) ParseMod(ctx context.Context, modFH source.FileHandle) (*sour
 			Converter: span.NewContentConverter(modFH.URI().Filename(), contents),
 			Content:   contents,
 		}
-		data := &parseModData{
-			parsed: &source.ParsedModule{
-				Mapper: m,
-			},
-		}
-		data.parsed.File, data.err = modfile.Parse(modFH.URI().Filename(), contents, nil)
-		if data.err != nil {
-			// Attempt to convert the error to a non-fatal parse error.
-			if parseErr, extractErr := extractModParseErrors(modFH.URI(), m, data.err, contents); extractErr == nil {
-				data.err = nil
-				data.parsed.ParseErrors = []source.Error{*parseErr}
+		file, parseErr := modfile.Parse(modFH.URI().Filename(), contents, nil)
+		// Attempt to convert the error to a standardized parse error.
+		var parseErrors []*source.Diagnostic
+		if parseErr != nil {
+			mfErrList, ok := parseErr.(modfile.ErrorList)
+			if !ok {
+				return &parseModData{err: fmt.Errorf("unexpected parse error type %v", parseErr)}
+			}
+			for _, mfErr := range mfErrList {
+				rng, err := rangeFromPositions(m, mfErr.Pos, mfErr.Pos)
+				if err != nil {
+					return &parseModData{err: err}
+				}
+				parseErrors = []*source.Diagnostic{{
+					URI:      modFH.URI(),
+					Range:    rng,
+					Severity: protocol.SeverityError,
+					Source:   source.ParseError,
+					Message:  mfErr.Err.Error(),
+				}}
 			}
 		}
-		return data
-	})
+		return &parseModData{
+			parsed: &source.ParsedModule{
+				URI:         modFH.URI(),
+				Mapper:      m,
+				File:        file,
+				ParseErrors: parseErrors,
+			},
+			err: parseErr,
+		}
+	}, nil)
 
 	pmh := &parseModHandle{handle: h}
 	s.mu.Lock()
@@ -89,74 +101,36 @@ func (s *snapshot) ParseMod(ctx context.Context, modFH source.FileHandle) (*sour
 	return pmh.parse(ctx, s)
 }
 
-func (s *snapshot) sumFH(ctx context.Context, modFH source.FileHandle) (source.FileHandle, error) {
+// goSum reads the go.sum file for the go.mod file at modURI, if it exists. If
+// it doesn't exist, it returns nil.
+func (s *snapshot) goSum(ctx context.Context, modURI span.URI) []byte {
 	// Get the go.sum file, either from the snapshot or directly from the
 	// cache. Avoid (*snapshot).GetFile here, as we don't want to add
 	// nonexistent file handles to the snapshot if the file does not exist.
-	sumURI := span.URIFromPath(sumFilename(modFH.URI()))
+	sumURI := span.URIFromPath(sumFilename(modURI))
 	var sumFH source.FileHandle = s.FindFile(sumURI)
 	if sumFH == nil {
 		var err error
 		sumFH, err = s.view.session.cache.getFile(ctx, sumURI)
 		if err != nil {
-			return nil, err
+			return nil
 		}
 	}
-	_, err := sumFH.Read()
+	content, err := sumFH.Read()
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	return sumFH, nil
+	return content
 }
 
 func sumFilename(modURI span.URI) string {
 	return strings.TrimSuffix(modURI.Filename(), ".mod") + ".sum"
 }
 
-// extractModParseErrors processes the raw errors returned by modfile.Parse,
-// extracting the filenames and line numbers that correspond to the errors.
-func extractModParseErrors(uri span.URI, m *protocol.ColumnMapper, parseErr error, content []byte) (*source.Error, error) {
-	re := regexp.MustCompile(`.*:([\d]+): (.+)`)
-	matches := re.FindStringSubmatch(strings.TrimSpace(parseErr.Error()))
-	if len(matches) < 3 {
-		return nil, errors.Errorf("could not parse go.mod error message: %s", parseErr)
-	}
-	line, err := strconv.Atoi(matches[1])
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(string(content), "\n")
-	if line > len(lines) {
-		return nil, errors.Errorf("could not parse go.mod error message %q, line number %v out of range", content, line)
-	}
-	// The error returned from the modfile package only returns a line number,
-	// so we assume that the diagnostic should be for the entire line.
-	endOfLine := len(lines[line-1])
-	sOffset, err := m.Converter.ToOffset(line, 0)
-	if err != nil {
-		return nil, err
-	}
-	eOffset, err := m.Converter.ToOffset(line, endOfLine)
-	if err != nil {
-		return nil, err
-	}
-	spn := span.New(uri, span.NewPoint(line, 0, sOffset), span.NewPoint(line, endOfLine, eOffset))
-	rng, err := m.Range(spn)
-	if err != nil {
-		return nil, err
-	}
-	return &source.Error{
-		Category: SyntaxError,
-		Message:  matches[2],
-		Range:    rng,
-		URI:      uri,
-	}, nil
-}
-
 // modKey is uniquely identifies cached data for `go mod why` or dependencies
 // to upgrade.
 type modKey struct {
-	sessionID, cfg, view string
+	sessionID, env, view string
 	mod                  source.FileIdentity
 	verb                 modAction
 }
@@ -189,19 +163,18 @@ func (mwh *modWhyHandle) why(ctx context.Context, snapshot *snapshot) (map[strin
 	return data.why, data.err
 }
 
-func (s *snapshot) ModWhy(ctx context.Context) (map[string]string, error) {
-	if err := s.awaitLoaded(ctx); err != nil {
-		return nil, err
+func (s *snapshot) ModWhy(ctx context.Context, fh source.FileHandle) (map[string]string, error) {
+	if fh.Kind() != source.Mod {
+		return nil, fmt.Errorf("%s is not a go.mod file", fh.URI())
 	}
-	fh, err := s.GetFile(ctx, s.view.modURI)
-	if err != nil {
-		return nil, err
+	if handle := s.getModWhyHandle(fh.URI()); handle != nil {
+		return handle.why(ctx, s)
 	}
 	key := modKey{
 		sessionID: s.view.session.id,
-		cfg:       hashConfig(s.config(ctx)),
+		env:       hashEnv(s),
 		mod:       fh.FileIdentity(),
-		view:      s.view.root.Filename(),
+		view:      s.view.rootURI.Filename(),
 		verb:      why,
 	}
 	h := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
@@ -219,11 +192,15 @@ func (s *snapshot) ModWhy(ctx context.Context) (map[string]string, error) {
 			return &modWhyData{}
 		}
 		// Run `go mod why` on all the dependencies.
-		args := []string{"why", "-m"}
-		for _, req := range pm.File.Require {
-			args = append(args, req.Mod.Path)
+		inv := &gocommand.Invocation{
+			Verb:       "mod",
+			Args:       []string{"why", "-m"},
+			WorkingDir: filepath.Dir(fh.URI().Filename()),
 		}
-		stdout, err := snapshot.RunGoCommand(ctx, "mod", args)
+		for _, req := range pm.File.Require {
+			inv.Args = append(inv.Args, req.Mod.Path)
+		}
+		stdout, err := snapshot.RunGoCommandDirect(ctx, source.Normal, inv)
 		if err != nil {
 			return &modWhyData{err: err}
 		}
@@ -238,120 +215,224 @@ func (s *snapshot) ModWhy(ctx context.Context) (map[string]string, error) {
 			why[req.Mod.Path] = whyList[i]
 		}
 		return &modWhyData{why: why}
-	})
+	}, nil)
 
 	mwh := &modWhyHandle{handle: h}
 	s.mu.Lock()
-	s.modWhyHandle = mwh
+	s.modWhyHandles[fh.URI()] = mwh
 	s.mu.Unlock()
 
-	return s.modWhyHandle.why(ctx, s)
+	return mwh.why(ctx, s)
 }
 
-type modUpgradeHandle struct {
-	handle *memoize.Handle
-}
+// extractGoCommandError tries to parse errors that come from the go command
+// and shape them into go.mod diagnostics.
+func (s *snapshot) extractGoCommandErrors(ctx context.Context, goCmdError string) ([]*source.Diagnostic, error) {
+	diagLocations := map[*source.ParsedModule]span.Span{}
+	backupDiagLocations := map[*source.ParsedModule]span.Span{}
 
-type modUpgradeData struct {
-	// upgrades maps modules to their latest versions.
-	upgrades map[string]string
-
-	err error
-}
-
-func (muh *modUpgradeHandle) Upgrades(ctx context.Context, snapshot *snapshot) (map[string]string, error) {
-	v, err := muh.handle.Get(ctx, snapshot.generation, snapshot)
-	if v == nil {
-		return nil, err
+	// The go command emits parse errors for completely invalid go.mod files.
+	// Those are reported by our own diagnostics and can be ignored here.
+	// As of writing, we are not aware of any other errors that include
+	// file/position information, so don't even try to find it.
+	if strings.Contains(goCmdError, "errors parsing go.mod") {
+		return nil, nil
 	}
-	data := v.(*modUpgradeData)
-	return data.upgrades, data.err
-}
 
-func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
-	if err := s.awaitLoaded(ctx); err != nil {
-		return nil, err
-	}
-	fh, err := s.GetFile(ctx, s.view.modURI)
-	if err != nil {
-		return nil, err
-	}
-	cfg := s.config(ctx)
-	key := modKey{
-		sessionID: s.view.session.id,
-		cfg:       hashConfig(cfg),
-		mod:       fh.FileIdentity(),
-		view:      s.view.root.Filename(),
-		verb:      upgrade,
-	}
-	h := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
-		ctx, done := event.Start(ctx, "cache.ModUpgradeHandle", tag.URI.Of(fh.URI()))
-		defer done()
-
-		snapshot := arg.(*snapshot)
-
+	// Match the error against all the mod files in the workspace.
+	for _, uri := range s.ModFiles() {
+		fh, err := s.GetFile(ctx, uri)
+		if err != nil {
+			return nil, err
+		}
 		pm, err := s.ParseMod(ctx, fh)
 		if err != nil {
-			return &modUpgradeData{err: err}
+			return nil, err
 		}
-
-		// No requires to upgrade.
-		if len(pm.File.Require) == 0 {
-			return &modUpgradeData{}
-		}
-		// Run "go list -mod readonly -u -m all" to be able to see which deps can be
-		// upgraded without modifying mod file.
-		args := []string{"-u", "-m", "all"}
-		if !snapshot.view.tmpMod || containsVendor(fh.URI()) {
-			// Use -mod=readonly if the module contains a vendor directory
-			// (see golang/go#38711).
-			args = append([]string{"-mod", "readonly"}, args...)
-		}
-		stdout, err := snapshot.RunGoCommand(ctx, "list", args)
+		spn, found, err := s.matchErrorToModule(ctx, pm, goCmdError)
 		if err != nil {
-			return &modUpgradeData{err: err}
+			return nil, err
 		}
-		upgradesList := strings.Split(stdout.String(), "\n")
-		if len(upgradesList) <= 1 {
-			return nil
+		if found {
+			diagLocations[pm] = spn
+		} else {
+			backupDiagLocations[pm] = spn
 		}
-		upgrades := make(map[string]string)
-		for _, upgrade := range upgradesList[1:] {
-			// Example: "github.com/x/tools v1.1.0 [v1.2.0]"
-			info := strings.Split(upgrade, " ")
-			if len(info) != 3 {
-				continue
-			}
-			dep, version := info[0], info[2]
+	}
 
-			// Make sure that the format matches our expectation.
-			if len(version) < 2 {
-				continue
-			}
-			if version[0] != '[' || version[len(version)-1] != ']' {
-				continue
-			}
-			latest := version[1 : len(version)-1] // remove the "[" and "]"
-			upgrades[dep] = latest
-		}
-		return &modUpgradeData{
-			upgrades: upgrades,
-		}
-	})
-	muh := &modUpgradeHandle{handle: h}
-	s.mu.Lock()
-	s.modUpgradeHandle = muh
-	s.mu.Unlock()
+	// If we didn't find any good matches, assign diagnostics to all go.mod files.
+	if len(diagLocations) == 0 {
+		diagLocations = backupDiagLocations
+	}
 
-	return s.modUpgradeHandle.Upgrades(ctx, s)
+	var srcErrs []*source.Diagnostic
+	for pm, spn := range diagLocations {
+		diag, err := s.goCommandDiagnostic(pm, spn, goCmdError)
+		if err != nil {
+			return nil, err
+		}
+		srcErrs = append(srcErrs, diag)
+	}
+	return srcErrs, nil
 }
 
-// containsVendor reports whether the module has a vendor folder.
-func containsVendor(modURI span.URI) bool {
-	dir := filepath.Dir(modURI.Filename())
-	f, err := os.Stat(filepath.Join(dir, "vendor"))
-	if err != nil {
-		return false
+var moduleVersionInErrorRe = regexp.MustCompile(`[:\s]([+-._~0-9A-Za-z]+)@([+-._~0-9A-Za-z]+)[:\s]`)
+
+// matchErrorToModule matches a go command error message to a go.mod file.
+// Some examples:
+//
+//    example.com@v1.2.2: reading example.com/@v/v1.2.2.mod: no such file or directory
+//    go: github.com/cockroachdb/apd/v2@v2.0.72: reading github.com/cockroachdb/apd/go.mod at revision v2.0.72: unknown revision v2.0.72
+//    go: example.com@v1.2.3 requires\n\trandom.org@v1.2.3: parsing go.mod:\n\tmodule declares its path as: bob.org\n\tbut was required as: random.org
+//
+// It returns the location of a reference to the one of the modules and true
+// if one exists. If none is found it returns a fallback location and false.
+func (s *snapshot) matchErrorToModule(ctx context.Context, pm *source.ParsedModule, goCmdError string) (span.Span, bool, error) {
+	var reference *modfile.Line
+	matches := moduleVersionInErrorRe.FindAllStringSubmatch(goCmdError, -1)
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		ver := module.Version{Path: matches[i][1], Version: matches[i][2]}
+		// Any module versions that come from the workspace module should not
+		// be shown to the user.
+		if source.IsWorkspaceModuleVersion(ver.Version) {
+			continue
+		}
+		if err := module.Check(ver.Path, ver.Version); err != nil {
+			continue
+		}
+		reference = findModuleReference(pm.File, ver)
+		if reference != nil {
+			break
+		}
 	}
-	return f.IsDir()
+
+	if reference == nil {
+		// No match for the module path was found in the go.mod file.
+		// Show the error on the module declaration, if one exists, or
+		// just the first line of the file.
+		if pm.File.Module == nil {
+			return span.New(pm.URI, span.NewPoint(1, 1, 0), span.Point{}), false, nil
+		}
+		spn, err := spanFromPositions(pm.Mapper, pm.File.Module.Syntax.Start, pm.File.Module.Syntax.End)
+		return spn, false, err
+	}
+
+	spn, err := spanFromPositions(pm.Mapper, reference.Start, reference.End)
+	return spn, true, err
+}
+
+// goCommandDiagnostic creates a diagnostic for a given go command error.
+func (s *snapshot) goCommandDiagnostic(pm *source.ParsedModule, spn span.Span, goCmdError string) (*source.Diagnostic, error) {
+	rng, err := pm.Mapper.Range(spn)
+	if err != nil {
+		return nil, err
+	}
+
+	matches := moduleVersionInErrorRe.FindAllStringSubmatch(goCmdError, -1)
+	var innermost *module.Version
+	for i := len(matches) - 1; i >= 0; i-- {
+		ver := module.Version{Path: matches[i][1], Version: matches[i][2]}
+		// Any module versions that come from the workspace module should not
+		// be shown to the user.
+		if source.IsWorkspaceModuleVersion(ver.Version) {
+			continue
+		}
+		if err := module.Check(ver.Path, ver.Version); err != nil {
+			continue
+		}
+		innermost = &ver
+		break
+	}
+
+	switch {
+	case strings.Contains(goCmdError, "inconsistent vendoring"):
+		cmd, err := command.NewVendorCommand("Run go mod vendor", command.URIArg{URI: protocol.URIFromSpanURI(pm.URI)})
+		if err != nil {
+			return nil, err
+		}
+		return &source.Diagnostic{
+			URI:      pm.URI,
+			Range:    rng,
+			Severity: protocol.SeverityError,
+			Source:   source.ListError,
+			Message: `Inconsistent vendoring detected. Please re-run "go mod vendor".
+See https://github.com/golang/go/issues/39164 for more detail on this issue.`,
+			SuggestedFixes: []source.SuggestedFix{source.SuggestedFixFromCommand(cmd, protocol.QuickFix)},
+		}, nil
+
+	case strings.Contains(goCmdError, "updates to go.sum needed"), strings.Contains(goCmdError, "missing go.sum entry"):
+		var args []protocol.DocumentURI
+		for _, uri := range s.ModFiles() {
+			args = append(args, protocol.URIFromSpanURI(uri))
+		}
+		tidyCmd, err := command.NewTidyCommand("Run go mod tidy", command.URIArgs{URIs: args})
+		if err != nil {
+			return nil, err
+		}
+		updateCmd, err := command.NewUpdateGoSumCommand("Update go.sum", command.URIArgs{URIs: args})
+		if err != nil {
+			return nil, err
+		}
+		msg := "go.sum is out of sync with go.mod. Please update it by applying the quick fix."
+		if innermost != nil {
+			msg = fmt.Sprintf("go.sum is out of sync with go.mod: entry for %v is missing. Please updating it by applying the quick fix.", innermost)
+		}
+		return &source.Diagnostic{
+			URI:      pm.URI,
+			Range:    rng,
+			Severity: protocol.SeverityError,
+			Source:   source.ListError,
+			Message:  msg,
+			SuggestedFixes: []source.SuggestedFix{
+				source.SuggestedFixFromCommand(tidyCmd, protocol.QuickFix),
+				source.SuggestedFixFromCommand(updateCmd, protocol.QuickFix),
+			},
+		}, nil
+	case strings.Contains(goCmdError, "disabled by GOPROXY=off") && innermost != nil:
+		title := fmt.Sprintf("Download %v@%v", innermost.Path, innermost.Version)
+		cmd, err := command.NewAddDependencyCommand(title, command.DependencyArgs{
+			URI:        protocol.URIFromSpanURI(pm.URI),
+			AddRequire: false,
+			GoCmdArgs:  []string{fmt.Sprintf("%v@%v", innermost.Path, innermost.Version)},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &source.Diagnostic{
+			URI:            pm.URI,
+			Range:          rng,
+			Severity:       protocol.SeverityError,
+			Message:        fmt.Sprintf("%v@%v has not been downloaded", innermost.Path, innermost.Version),
+			Source:         source.ListError,
+			SuggestedFixes: []source.SuggestedFix{source.SuggestedFixFromCommand(cmd, protocol.QuickFix)},
+		}, nil
+	default:
+		return &source.Diagnostic{
+			URI:      pm.URI,
+			Range:    rng,
+			Severity: protocol.SeverityError,
+			Source:   source.ListError,
+			Message:  goCmdError,
+		}, nil
+	}
+}
+
+func findModuleReference(mf *modfile.File, ver module.Version) *modfile.Line {
+	for _, req := range mf.Require {
+		if req.Mod == ver {
+			return req.Syntax
+		}
+	}
+	for _, ex := range mf.Exclude {
+		if ex.Mod == ver {
+			return ex.Syntax
+		}
+	}
+	for _, rep := range mf.Replace {
+		if rep.New == ver || rep.Old == ver {
+			return rep.Syntax
+		}
+	}
+	return nil
 }

@@ -5,13 +5,15 @@
 package regtest
 
 import (
-	"errors"
+	"encoding/json"
 	"io"
+	"path"
 	"testing"
 
-	"golang.org/x/tools/internal/lsp"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/fake"
 	"golang.org/x/tools/internal/lsp/protocol"
+	errors "golang.org/x/xerrors"
 )
 
 func (e *Env) ChangeFilesOnDisk(events []fake.FileEvent) {
@@ -67,13 +69,6 @@ func (e *Env) OpenFile(name string) {
 	}
 }
 
-func (e *Env) OpenFileWithContent(name, content string) {
-	e.T.Helper()
-	if err := e.Editor.OpenFileWithContent(e.Ctx, name, content); err != nil {
-		e.T.Fatal(err)
-	}
-}
-
 // CreateBuffer creates a buffer in the editor, calling t.Fatal on any error.
 func (e *Env) CreateBuffer(name string, content string) {
 	e.T.Helper()
@@ -97,6 +92,28 @@ func (e *Env) EditBuffer(name string, edits ...fake.Edit) {
 	if err := e.Editor.EditBuffer(e.Ctx, name, edits); err != nil {
 		e.T.Fatal(err)
 	}
+}
+
+func (e *Env) SetBufferContent(name string, content string) {
+	e.T.Helper()
+	if err := e.Editor.SetBufferContent(e.Ctx, name, content); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+// RegexpRange returns the range of the first match for re in the buffer
+// specified by name, calling t.Fatal on any error. It first searches for the
+// position in open buffers, then in workspace files.
+func (e *Env) RegexpRange(name, re string) (fake.Pos, fake.Pos) {
+	e.T.Helper()
+	start, end, err := e.Editor.RegexpRange(name, re)
+	if err == fake.ErrUnknownBuffer {
+		start, end, err = e.Sandbox.Workdir.RegexpRange(name, re)
+	}
+	if err != nil {
+		e.T.Fatalf("RegexpRange: %v, %v", name, err)
+	}
+	return start, end
 }
 
 // RegexpSearch returns the starting position of the first match for re in the
@@ -131,8 +148,15 @@ func (e *Env) SaveBuffer(name string) {
 	}
 }
 
+func (e *Env) SaveBufferWithoutActions(name string) {
+	e.T.Helper()
+	if err := e.Editor.SaveBufferWithoutActions(e.Ctx, name); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
 // GoToDefinition goes to definition in the editor, calling t.Fatal on any
-// error.
+// error. It returns the path and position of the resulting jump.
 func (e *Env) GoToDefinition(name string, pos fake.Pos) (string, fake.Pos) {
 	e.T.Helper()
 	n, p, err := e.Editor.GoToDefinition(e.Ctx, name, pos)
@@ -177,6 +201,24 @@ func (e *Env) ApplyQuickFixes(path string, diagnostics []protocol.Diagnostic) {
 	}
 }
 
+// ApplyCodeAction applies the given code action.
+func (e *Env) ApplyCodeAction(action protocol.CodeAction) {
+	e.T.Helper()
+	if err := e.Editor.ApplyCodeAction(e.Ctx, action); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+// GetQuickFixes returns the available quick fix code actions.
+func (e *Env) GetQuickFixes(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
+	e.T.Helper()
+	actions, err := e.Editor.GetQuickFixes(e.Ctx, path, nil, diagnostics)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return actions
+}
+
 // Hover in the editor, calling t.Fatal on any error.
 func (e *Env) Hover(name string, pos fake.Pos) (*protocol.MarkupContent, fake.Pos) {
 	e.T.Helper()
@@ -196,7 +238,16 @@ func (e *Env) DocumentLink(name string) []protocol.DocumentLink {
 	return links
 }
 
-func checkIsFatal(t *testing.T, err error) {
+func (e *Env) DocumentHighlight(name string, pos fake.Pos) []protocol.DocumentHighlight {
+	e.T.Helper()
+	highlights, err := e.Editor.DocumentHighlight(e.Ctx, name, pos)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return highlights
+}
+
+func checkIsFatal(t testing.TB, err error) {
 	t.Helper()
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatal(err)
@@ -217,11 +268,42 @@ func (e *Env) RunGenerate(dir string) {
 	if err := e.Editor.RunGenerate(e.Ctx, dir); err != nil {
 		e.T.Fatal(err)
 	}
-	e.Await(CompletedWork(lsp.GenerateWorkDoneTitle, 1))
+	e.Await(NoOutstandingWork())
 	// Ideally the fake.Workspace would handle all synthetic file watching, but
 	// we help it out here as we need to wait for the generate command to
 	// complete before checking the filesystem.
 	e.CheckForFileChanges()
+}
+
+// RunGoCommand runs the given command in the sandbox's default working
+// directory.
+func (e *Env) RunGoCommand(verb string, args ...string) {
+	e.T.Helper()
+	if err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args, true); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+// RunGoCommandInDir is like RunGoCommand, but executes in the given
+// relative directory of the sandbox.
+func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
+	e.T.Helper()
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, true); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+// DumpGoSum prints the correct go.sum contents for dir in txtar format,
+// for use in creating regtests.
+func (e *Env) DumpGoSum(dir string) {
+	e.T.Helper()
+
+	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "..."}, true); err != nil {
+		e.T.Fatal(err)
+	}
+	sumFile := path.Join(dir, "/go.sum")
+	e.T.Log("\n\n-- " + sumFile + " --\n" + e.ReadWorkspaceFile(sumFile))
+	e.T.Fatal("see contents above")
 }
 
 // CheckForFileChanges triggers a manual poll of the workspace for any file
@@ -245,11 +327,56 @@ func (e *Env) CodeLens(path string) []protocol.CodeLens {
 	return lens
 }
 
-// ReferencesAtRegexp calls textDocument/references for the given path at the
-// position of the given regexp.
-func (e *Env) ReferencesAtRegexp(path string, re string) []protocol.Location {
+// ExecuteCodeLensCommand executes the command for the code lens matching the
+// given command name.
+func (e *Env) ExecuteCodeLensCommand(path string, cmd command.Command) {
 	e.T.Helper()
-	pos := e.RegexpSearch(path, re)
+	lenses := e.CodeLens(path)
+	var lens protocol.CodeLens
+	var found bool
+	for _, l := range lenses {
+		if l.Command.Command == cmd.ID() {
+			lens = l
+			found = true
+		}
+	}
+	if !found {
+		e.T.Fatalf("found no command with the ID %s", cmd.ID())
+	}
+	e.ExecuteCommand(&protocol.ExecuteCommandParams{
+		Command:   lens.Command.Command,
+		Arguments: lens.Command.Arguments,
+	}, nil)
+}
+
+func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result interface{}) {
+	e.T.Helper()
+	response, err := e.Editor.ExecuteCommand(e.Ctx, params)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	if result == nil {
+		return
+	}
+	// Hack: The result of an executeCommand request will be unmarshaled into
+	// maps. Re-marshal and unmarshal into the type we expect.
+	//
+	// This could be improved by generating a jsonrpc2 command client from the
+	// command.Interface, but that should only be done if we're consolidating
+	// this part of the tsprotocol generation.
+	data, err := json.Marshal(response)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	if err := json.Unmarshal(data, result); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
+// References calls textDocument/references for the given path at the given
+// position.
+func (e *Env) References(path string, pos fake.Pos) []protocol.Location {
+	e.T.Helper()
 	locations, err := e.Editor.References(e.Ctx, path, pos)
 	if err != nil {
 		e.T.Fatal(err)
@@ -257,15 +384,43 @@ func (e *Env) ReferencesAtRegexp(path string, re string) []protocol.Location {
 	return locations
 }
 
+// Completion executes a completion request on the server.
+func (e *Env) Completion(path string, pos fake.Pos) *protocol.CompletionList {
+	e.T.Helper()
+	completions, err := e.Editor.Completion(e.Ctx, path, pos)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return completions
+}
+
+// AcceptCompletion accepts a completion for the given item at the given
+// position.
+func (e *Env) AcceptCompletion(path string, pos fake.Pos, item protocol.CompletionItem) {
+	e.T.Helper()
+	if err := e.Editor.AcceptCompletion(e.Ctx, path, pos, item); err != nil {
+		e.T.Fatal(err)
+	}
+}
+
 // CodeAction calls testDocument/codeAction for the given path, and calls
 // t.Fatal if there are errors.
-func (e *Env) CodeAction(path string) []protocol.CodeAction {
+func (e *Env) CodeAction(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
 	e.T.Helper()
-	actions, err := e.Editor.CodeAction(e.Ctx, path, nil)
+	actions, err := e.Editor.CodeAction(e.Ctx, path, nil, diagnostics)
 	if err != nil {
 		e.T.Fatal(err)
 	}
 	return actions
+}
+
+func (e *Env) ChangeConfiguration(t *testing.T, config *fake.EditorConfig) {
+	e.Editor.Config = *config
+	if err := e.Editor.Server.DidChangeConfiguration(e.Ctx, &protocol.DidChangeConfigurationParams{
+		// gopls currently ignores the Settings field
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ChangeEnv modifies the editor environment and reconfigures the LSP client.

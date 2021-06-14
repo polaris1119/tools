@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package imports
 
 import (
@@ -652,6 +656,7 @@ var proxyDir string
 type modTest struct {
 	*testing.T
 	env      *ProcessEnv
+	gopath   string
 	resolver *ModuleResolver
 	cleanup  func()
 }
@@ -687,6 +692,7 @@ func setup(t *testing.T, main, wd string) *modTest {
 	env := &ProcessEnv{
 		Env: map[string]string{
 			"GOPATH":      filepath.Join(dir, "gopath"),
+			"GOMODCACHE":  "",
 			"GO111MODULE": "on",
 			"GOSUMDB":     "off",
 			"GOPROXY":     proxydir.ToURL(proxyDir),
@@ -703,7 +709,7 @@ func setup(t *testing.T, main, wd string) *modTest {
 		t.Fatalf("checking if go.mod exists: %v", err)
 	}
 	if err == nil {
-		if _, err := env.invokeGo(context.Background(), "mod", "download"); err != nil {
+		if _, err := env.invokeGo(context.Background(), "mod", "download", "all"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -714,6 +720,7 @@ func setup(t *testing.T, main, wd string) *modTest {
 	}
 	return &modTest{
 		T:        t,
+		gopath:   env.Env["GOPATH"],
 		env:      env,
 		resolver: resolver.(*ModuleResolver),
 		cleanup:  func() { removeDir(dir) },
@@ -841,7 +848,7 @@ package x
 import _ "rsc.io/quote"
 `, "")
 	defer mt.cleanup()
-	want := filepath.Join(mt.resolver.env.gopath(), "pkg/mod", "rsc.io/quote@v1.5.2")
+	want := filepath.Join(mt.gopath, "pkg/mod", "rsc.io/quote@v1.5.2")
 
 	found := mt.assertScanFinds("rsc.io/quote", "quote")
 	modDir, _ := mt.resolver.modInfo(found.dir)
@@ -888,10 +895,14 @@ func TestGetCandidatesRanking(t *testing.T) {
 module example.com
 
 require rsc.io/quote v1.5.1
+require rsc.io/quote/v3 v3.0.0
 
 -- rpackage/x.go --
 package rpackage
-import _ "rsc.io/quote"
+import (
+	_ "rsc.io/quote"
+	_ "rsc.io/quote/v3"
+)
 `, "")
 	defer mt.cleanup()
 
@@ -900,7 +911,7 @@ import _ "rsc.io/quote"
 	}
 
 	type res struct {
-		relevance  int
+		relevance  float64
 		name, path string
 	}
 	want := []res{
@@ -909,6 +920,8 @@ import _ "rsc.io/quote"
 		{7, "http", "net/http"},
 		// Main module
 		{6, "rpackage", "example.com/rpackage"},
+		// Direct module deps with v2+ major version
+		{5.003, "quote", "rsc.io/quote/v3"},
 		// Direct module deps
 		{5, "quote", "rsc.io/quote"},
 		// Indirect deps

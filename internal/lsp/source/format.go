@@ -14,6 +14,7 @@ import (
 	"go/parser"
 	"go/token"
 	"strings"
+	"text/scanner"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
@@ -93,8 +94,8 @@ func AllImportsFixes(ctx context.Context, snapshot Snapshot, fh FileHandle) (all
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := snapshot.View().RunProcessEnvFunc(ctx, func(opts *imports.Options) error {
-		allFixEdits, editsPerFix, err = computeImportEdits(ctx, snapshot, pgf, opts)
+	if err := snapshot.RunProcessEnvFunc(ctx, func(opts *imports.Options) error {
+		allFixEdits, editsPerFix, err = computeImportEdits(snapshot, pgf, opts)
 		return err
 	}); err != nil {
 		return nil, nil, fmt.Errorf("AllImportsFixes: %v", err)
@@ -104,7 +105,7 @@ func AllImportsFixes(ctx context.Context, snapshot Snapshot, fh FileHandle) (all
 
 // computeImportEdits computes a set of edits that perform one or all of the
 // necessary import fixes.
-func computeImportEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
+func computeImportEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*ImportFix, err error) {
 	filename := pgf.URI.Filename()
 
 	// Build up basic information about the original file.
@@ -133,9 +134,10 @@ func computeImportEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFil
 	return allFixEdits, editsPerFix, nil
 }
 
-func computeOneImportFixEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
+// ComputeOneImportFixEdits returns text edits for a single import fix.
+func ComputeOneImportFixEdits(snapshot Snapshot, pgf *ParsedGoFile, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
 	options := &imports.Options{
-		LocalPrefix: snapshot.View().Options().LocalPrefix,
+		LocalPrefix: snapshot.View().Options().Local,
 		// Defaults.
 		AllErrors:  true,
 		Comments:   true,
@@ -171,7 +173,10 @@ func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Opti
 	if fixedData == nil || fixedData[len(fixedData)-1] != '\n' {
 		fixedData = append(fixedData, '\n') // ApplyFixes may miss the newline, go figure.
 	}
-	edits := snapshot.View().Options().ComputeEdits(pgf.URI, left, string(fixedData))
+	edits, err := snapshot.View().Options().ComputeEdits(pgf.URI, left, string(fixedData))
+	if err != nil {
+		return nil, err
+	}
 	return ToProtocolEdits(pgf.Mapper, edits)
 }
 
@@ -225,9 +230,23 @@ func importPrefix(src []byte) string {
 		pkgEnd := f.Name.End()
 		importEnd = maybeAdjustToLineEnd(pkgEnd, false)
 	}
-	for _, c := range f.Comments {
-		if end := tok.Offset(c.End()); end > importEnd {
-			importEnd = maybeAdjustToLineEnd(c.End(), true)
+	for _, cgroup := range f.Comments {
+		for _, c := range cgroup.List {
+			if end := tok.Offset(c.End()); end > importEnd {
+				startLine := tok.Position(c.Pos()).Line
+				endLine := tok.Position(c.End()).Line
+
+				// Work around golang/go#41197 by checking if the comment might
+				// contain "\r", and if so, find the actual end position of the
+				// comment by scanning the content of the file.
+				startOffset := tok.Offset(c.Pos())
+				if startLine != endLine && bytes.Contains(src[startOffset:], []byte("\r")) {
+					if commentEnd := scanForCommentEnd(src[startOffset:]); commentEnd > 0 {
+						end = startOffset + commentEnd
+					}
+				}
+				importEnd = maybeAdjustToLineEnd(tok.Pos(end), true)
+			}
 		}
 	}
 	if importEnd > len(src) {
@@ -236,11 +255,28 @@ func importPrefix(src []byte) string {
 	return string(src[:importEnd])
 }
 
+// scanForCommentEnd returns the offset of the end of the multi-line comment
+// at the start of the given byte slice.
+func scanForCommentEnd(src []byte) int {
+	var s scanner.Scanner
+	s.Init(bytes.NewReader(src))
+	s.Mode ^= scanner.SkipComments
+
+	t := s.Scan()
+	if t == scanner.Comment {
+		return s.Pos().Offset
+	}
+	return 0
+}
+
 func computeTextEdits(ctx context.Context, snapshot Snapshot, pgf *ParsedGoFile, formatted string) ([]protocol.TextEdit, error) {
 	_, done := event.Start(ctx, "source.computeTextEdits")
 	defer done()
 
-	edits := snapshot.View().Options().ComputeEdits(pgf.URI, string(pgf.Src), formatted)
+	edits, err := snapshot.View().Options().ComputeEdits(pgf.URI, string(pgf.Src), formatted)
+	if err != nil {
+		return nil, err
+	}
 	return ToProtocolEdits(pgf.Mapper, edits)
 }
 

@@ -1,11 +1,12 @@
 module github.com/polaris1119/tools
 
-go 1.11
+go 1.17
 
 require (
-	github.com/yuin/goldmark v1.1.32
-	golang.org/x/mod v0.3.0
-	golang.org/x/net v0.0.0-20200625001655-4c5254603344
-	golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
-	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
+	github.com/yuin/goldmark v1.3.5
+	golang.org/x/mod v0.4.2
+	golang.org/x/net v0.0.0-20210405180319-a5a99cb37ef4
+	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	golang.org/x/sys v0.0.0-20210510120138-977fb7262007
+	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1
 )

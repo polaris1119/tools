@@ -325,7 +325,7 @@ func eq(b *ssa.BasicBlock) (op *ssa.BinOp, tsucc, fsucc *ssa.BasicBlock) {
 // ChangeInterface is the only expansion currently supported, but others, like
 // Slice, could be added. At this time, this tool does not check slice
 // operations in a way this expansion could help. See
-// https://play.golang.org/p/mGqXEp7w4fR for an example.
+// https://play.studygolang.com/p/mGqXEp7w4fR for an example.
 func expandFacts(f fact) []fact {
 	ff := []fact{f}
 

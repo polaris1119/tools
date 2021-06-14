@@ -29,7 +29,7 @@ import (
 	"golang.org/x/tools/internal/span"
 )
 
-func New(ctx context.Context, options func(*source.Options)) *Cache {
+func New(options func(*source.Options)) *Cache {
 	index := atomic.AddInt64(&cacheIndex, 1)
 	c := &Cache{
 		id:          strconv.FormatInt(index, 10),
@@ -57,6 +57,16 @@ type fileHandle struct {
 	bytes   []byte
 	hash    string
 	err     error
+
+	// size is the file length as reported by Stat, for the purpose of
+	// invalidation. Probably we could just use len(bytes), but this is done
+	// defensively in case the definition of file size in the file system
+	// differs.
+	size int64
+}
+
+func (h *fileHandle) Saved() bool {
+	return true
 }
 
 func (c *Cache) GetFile(ctx context.Context, uri span.URI) (source.FileHandle, error) {
@@ -66,24 +76,35 @@ func (c *Cache) GetFile(ctx context.Context, uri span.URI) (source.FileHandle, e
 func (c *Cache) getFile(ctx context.Context, uri span.URI) (*fileHandle, error) {
 	fi, statErr := os.Stat(uri.Filename())
 	if statErr != nil {
-		return &fileHandle{err: statErr}, nil
+		return &fileHandle{
+			err: statErr,
+			uri: uri,
+		}, nil
 	}
 
 	c.fileMu.Lock()
 	fh, ok := c.fileContent[uri]
 	c.fileMu.Unlock()
-	if ok && fh.modTime.Equal(fi.ModTime()) {
+
+	// Check mtime and file size to infer whether the file has changed. This is
+	// an imperfect heuristic. Notably on some real systems (such as WSL) the
+	// filesystem clock resolution can be large -- 1/64s was observed. Therefore
+	// it's quite possible for multiple file modifications to occur within a
+	// single logical 'tick'. This can leave the cache in an incorrect state, but
+	// unfortunately we can't afford to pay the price of reading the actual file
+	// content here. Or to be more precise, reading would be a risky change and
+	// we don't know if we can afford it.
+	//
+	// We check file size in an attempt to reduce the probability of false cache
+	// hits.
+	if ok && fh.modTime.Equal(fi.ModTime()) && fh.size == fi.Size() {
 		return fh, nil
 	}
 
-	select {
-	case ioLimit <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	fh, err := readFile(ctx, uri, fi)
+	if err != nil {
+		return nil, err
 	}
-	defer func() { <-ioLimit }()
-
-	fh = readFile(ctx, uri, fi.ModTime())
 	c.fileMu.Lock()
 	c.fileContent[uri] = fh
 	c.fileMu.Unlock()
@@ -93,7 +114,14 @@ func (c *Cache) getFile(ctx context.Context, uri span.URI) (*fileHandle, error) 
 // ioLimit limits the number of parallel file reads per process.
 var ioLimit = make(chan struct{}, 128)
 
-func readFile(ctx context.Context, uri span.URI, modTime time.Time) *fileHandle {
+func readFile(ctx context.Context, uri span.URI, fi os.FileInfo) (*fileHandle, error) {
+	select {
+	case ioLimit <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-ioLimit }()
+
 	ctx, done := event.Start(ctx, "cache.readFile", tag.File.Of(uri.Filename()))
 	_ = ctx
 	defer done()
@@ -101,24 +129,30 @@ func readFile(ctx context.Context, uri span.URI, modTime time.Time) *fileHandle 
 	data, err := ioutil.ReadFile(uri.Filename())
 	if err != nil {
 		return &fileHandle{
-			modTime: modTime,
+			modTime: fi.ModTime(),
+			size:    fi.Size(),
 			err:     err,
-		}
+		}, nil
 	}
 	return &fileHandle{
-		modTime: modTime,
+		modTime: fi.ModTime(),
+		size:    fi.Size(),
 		uri:     uri,
 		bytes:   data,
 		hash:    hashContents(data),
-	}
+	}, nil
 }
 
 func (c *Cache) NewSession(ctx context.Context) *Session {
 	index := atomic.AddInt64(&sessionIndex, 1)
+	options := source.DefaultOptions().Clone()
+	if c.options != nil {
+		c.options(options)
+	}
 	s := &Session{
 		cache:       c,
 		id:          strconv.FormatInt(index, 10),
-		options:     source.DefaultOptions(),
+		options:     options,
 		overlays:    make(map[span.URI]*overlay),
 		gocmdRunner: &gocommand.Runner{},
 	}
@@ -236,7 +270,7 @@ func astCost(f *ast.File) int64 {
 		return 0
 	}
 	var count int64
-	ast.Inspect(f, func(n ast.Node) bool {
+	ast.Inspect(f, func(_ ast.Node) bool {
 		count += 32 // nodes are pretty small.
 		return true
 	})

@@ -1,4 +1,4 @@
-// Copyright 2012 The Go Authors.  All rights reserved.
+// Copyright 2012 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -18,8 +18,8 @@ import (
 	"golang.org/x/tools/playground/socket"
 	"golang.org/x/tools/present"
 
-	// This will register handlers at /compile and /share that will proxy to the
-	// respective endpoints at play.golang.org. This allows the frontend to call
+	// This will register a handler at /compile that will proxy to the
+	// respective endpoints at play.studygolang.com. This allows the frontend to call
 	// these endpoints without needing cross-origin request sharing (CORS).
 	// Note that this is imported regardless of whether the endpoints are used or
 	// not (in the case of a local socket connection, they are not called).
@@ -80,7 +80,7 @@ func initPlayground(basepath string, origin *url.URL) {
 func playable(c present.Code) bool {
 	play := present.PlayEnabled && c.Play
 
-	// Restrict playable files to only Go source files when using play.golang.org,
+	// Restrict playable files to only Go source files when using play.studygolang.com,
 	// since there is no method to execute shell scripts there.
 	if *usePlayground {
 		return play && c.Ext == ".go"

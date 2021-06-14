@@ -22,10 +22,18 @@ func Highlight(ctx context.Context, snapshot Snapshot, fh FileHandle, pos protoc
 	ctx, done := event.Start(ctx, "source.Highlight")
 	defer done()
 
-	pkg, pgf, err := getParsedFile(ctx, snapshot, fh, WidestPackage)
+	// Don't use GetParsedFile because it uses TypecheckWorkspace, and we
+	// always want fully parsed files for highlight, regardless of whether
+	// the file belongs to a workspace package.
+	pkg, err := snapshot.PackageForFile(ctx, fh.URI(), TypecheckFull, WidestPackage)
 	if err != nil {
-		return nil, fmt.Errorf("getting file for Highlight: %w", err)
+		return nil, errors.Errorf("getting package for Highlight: %w", err)
 	}
+	pgf, err := pkg.File(fh.URI())
+	if err != nil {
+		return nil, errors.Errorf("getting file for Highlight: %w", err)
+	}
+
 	spn, err := pgf.Mapper.PointSpan(pos)
 	if err != nil {
 		return nil, err
@@ -333,13 +341,13 @@ Outer:
 		return
 	}
 
-	// Find labeled branch statements in any loop
+	// Find labeled branch statements in any loop.
 	ast.Inspect(loop, func(n ast.Node) bool {
 		b, ok := n.(*ast.BranchStmt)
 		if !ok {
 			return true
 		}
-		// Statment with labels that matches the loop.
+		// statement with labels that matches the loop
 		if b.Label != nil && labelDecl(b.Label) == loopLabel {
 			result[posRange{start: b.Pos(), end: b.End()}] = struct{}{}
 		}

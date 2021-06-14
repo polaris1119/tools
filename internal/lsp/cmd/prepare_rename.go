@@ -6,13 +6,13 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/tool"
+	errors "golang.org/x/xerrors"
 )
 
 // prepareRename implements the prepare_rename verb for gopls.
@@ -30,8 +30,6 @@ Example:
 	$ # 1-indexed location (:line:column or :#offset) of the target identifier
 	$ gopls prepare_rename helper/helper.go:8:6
 	$ gopls prepare_rename helper/helper.go:#53
-
-	gopls prepare_rename flags are:
 `)
 	f.PrintDefaults()
 }
@@ -68,7 +66,7 @@ func (r *prepareRename) Run(ctx context.Context, args ...string) error {
 	}
 	result, err := conn.PrepareRename(ctx, &p)
 	if err != nil {
-		return fmt.Errorf("prepare_rename failed: %w", err)
+		return errors.Errorf("prepare_rename failed: %w", err)
 	}
 	if result == nil {
 		return ErrInvalidRenamePosition

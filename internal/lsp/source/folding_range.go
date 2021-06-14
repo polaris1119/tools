@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package source
 
 import (
@@ -5,13 +9,14 @@ import (
 	"go/ast"
 	"go/token"
 	"sort"
+	"strings"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 )
 
 // FoldingRangeInfo holds range and kind info of folding for an ast.Node
 type FoldingRangeInfo struct {
-	mappedRange
+	MappedRange
 	Kind protocol.FoldingRangeKind
 }
 
@@ -23,6 +28,19 @@ func FoldingRange(ctx context.Context, snapshot Snapshot, fh FileHandle, lineFol
 	if err != nil {
 		return nil, err
 	}
+
+	// With parse errors, we wouldn't be able to produce accurate folding info.
+	// LSP protocol (3.16) currently does not have a way to handle this case
+	// (https://github.com/microsoft/language-server-protocol/issues/1200).
+	// We cannot return an error either because we are afraid some editors
+	// may not handle errors nicely. As a workaround, we now return an empty
+	// result and let the client handle this case by double check the file
+	// contents (i.e. if the file is not empty and the folding range result
+	// is empty, raise an internal error).
+	if pgf.ParseErr != nil {
+		return nil, nil
+	}
+
 	fset := snapshot.FileSet()
 
 	// Get folding ranges for comments separately as they are not walked by ast.Inspect.
@@ -106,7 +124,7 @@ func foldingRangeFunc(fset *token.FileSet, m *protocol.ColumnMapper, n ast.Node,
 		return nil
 	}
 	return &FoldingRangeInfo{
-		mappedRange: newMappedRange(fset, m, start, end),
+		MappedRange: NewMappedRange(fset, m, start, end),
 		Kind:        kind,
 	}
 }
@@ -134,17 +152,27 @@ func validLineFoldingRange(fset *token.FileSet, open, close, start, end token.Po
 }
 
 // commentsFoldingRange returns the folding ranges for all comment blocks in file.
-// The folding range starts at the end of the first comment, and ends at the end of the
+// The folding range starts at the end of the first line of the comment block, and ends at the end of the
 // comment block and has kind protocol.Comment.
 func commentsFoldingRange(fset *token.FileSet, m *protocol.ColumnMapper, file *ast.File) (comments []*FoldingRangeInfo) {
 	for _, commentGrp := range file.Comments {
-		// Don't fold single comments.
-		if len(commentGrp.List) <= 1 {
+		startGrp, endGrp := fset.Position(commentGrp.Pos()), fset.Position(commentGrp.End())
+		if startGrp.Line == endGrp.Line {
+			// Don't fold single line comments.
 			continue
+		}
+
+		firstComment := commentGrp.List[0]
+		startPos, endLinePos := firstComment.Pos(), firstComment.End()
+		startCmmnt, endCmmnt := fset.Position(startPos), fset.Position(endLinePos)
+		if startCmmnt.Line != endCmmnt.Line {
+			// If the first comment spans multiple lines, then we want to have the
+			// folding range start at the end of the first line.
+			endLinePos = token.Pos(int(startPos) + len(strings.Split(firstComment.Text, "\n")[0]))
 		}
 		comments = append(comments, &FoldingRangeInfo{
 			// Fold from the end of the first line comment to the end of the comment block.
-			mappedRange: newMappedRange(fset, m, commentGrp.List[0].End(), commentGrp.End()),
+			MappedRange: NewMappedRange(fset, m, endLinePos, commentGrp.End()),
 			Kind:        protocol.Comment,
 		})
 	}

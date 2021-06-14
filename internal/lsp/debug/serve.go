@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"log"
+	stdlog "log"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	rpprof "runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,25 +35,27 @@ import (
 	"golang.org/x/tools/internal/event/keys"
 	"golang.org/x/tools/internal/event/label"
 	"golang.org/x/tools/internal/lsp/cache"
+	"golang.org/x/tools/internal/lsp/debug/log"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
-	"golang.org/x/xerrors"
+	errors "golang.org/x/xerrors"
 )
 
-type instanceKeyType int
+type contextKeyType int
 
-const instanceKey = instanceKeyType(0)
+const (
+	instanceKey contextKeyType = iota
+	traceKey
+)
 
 // An Instance holds all debug information associated with a gopls instance.
 type Instance struct {
-	Logfile              string
-	StartTime            time.Time
-	ServerAddress        string
-	DebugAddress         string
-	ListenedDebugAddress string
-	Workdir              string
-	OCAgentConfig        string
+	Logfile       string
+	StartTime     time.Time
+	ServerAddress string
+	Workdir       string
+	OCAgentConfig string
 
 	LogWriter io.Writer
 
@@ -60,9 +63,13 @@ type Instance struct {
 
 	ocagent    *ocagent.Exporter
 	prometheus *prometheus.Exporter
-	rpcs       *rpcs
+	rpcs       *Rpcs
 	traces     *traces
 	State      *State
+
+	serveMu              sync.Mutex
+	debugAddress         string
+	listenedDebugAddress string
 }
 
 // State holds debugging information related to the server state.
@@ -70,6 +77,45 @@ type State struct {
 	mu      sync.Mutex
 	clients []*Client
 	servers []*Server
+
+	// bugs maps bug description -> formatted event
+	bugs map[string]string
+}
+
+func Bug(ctx context.Context, desc, format string, args ...interface{}) {
+	labels := []label.Label{tag.Bug.Of(desc)}
+	_, file, line, ok := runtime.Caller(1)
+	if ok {
+		labels = append(labels, tag.Callsite.Of(fmt.Sprintf("%s:%d", file, line)))
+	}
+	msg := fmt.Sprintf(format, args...)
+	event.Log(ctx, msg, labels...)
+}
+
+type bug struct {
+	Description, Event string
+}
+
+func (st *State) Bugs() []bug {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var bugs []bug
+	for k, v := range st.bugs {
+		bugs = append(bugs, bug{k, v})
+	}
+	sort.Slice(bugs, func(i, j int) bool {
+		return bugs[i].Description < bugs[j].Description
+	})
+	return bugs
+}
+
+func (st *State) recordBug(description, event string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.bugs == nil {
+		st.bugs = make(map[string]string)
+	}
+	st.bugs[description] = event
 }
 
 // Caches returns the set of Cache objects currently being served.
@@ -151,7 +197,7 @@ func (st *State) Clients() []*Client {
 	return clients
 }
 
-// View returns the View that matches the supplied id.
+// Client returns the Client matching the supplied id.
 func (st *State) Client(id string) *Client {
 	for _, c := range st.Clients() {
 		if c.Session.ID() == id {
@@ -177,6 +223,7 @@ type Client struct {
 	Logfile      string
 	GoplsPath    string
 	ServerID     string
+	Service      protocol.Server
 }
 
 // A Server is an outgoing connection to a remote LSP server.
@@ -211,9 +258,20 @@ func (st *State) dropClient(session source.Session) {
 
 // AddServer adds a server to the set being queried. In practice, there should
 // be at most one remote server.
-func (st *State) addServer(server *Server) {
+func (st *State) updateServer(server *Server) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	for i, existing := range st.servers {
+		if existing.ID == server.ID {
+			// Replace, rather than mutate, to avoid a race.
+			newServers := make([]*Server, len(st.servers))
+			copy(newServers, st.servers[:i])
+			newServers[i] = server
+			copy(newServers[i+1:], st.servers[i+1:])
+			st.servers = newServers
+			return
+		}
+	}
 	st.servers = append(st.servers, server)
 }
 
@@ -231,6 +289,36 @@ func (st *State) dropServer(id string) {
 	}
 }
 
+// an http.ResponseWriter that filters writes
+type filterResponse struct {
+	w    http.ResponseWriter
+	edit func([]byte) []byte
+}
+
+func (c filterResponse) Header() http.Header {
+	return c.w.Header()
+}
+
+func (c filterResponse) Write(buf []byte) (int, error) {
+	ans := c.edit(buf)
+	return c.w.Write(ans)
+}
+
+func (c filterResponse) WriteHeader(n int) {
+	c.w.WriteHeader(n)
+}
+
+// replace annoying nuls by spaces
+func cmdline(w http.ResponseWriter, r *http.Request) {
+	fake := filterResponse{
+		w: w,
+		edit: func(buf []byte) []byte {
+			return bytes.ReplaceAll(buf, []byte{0}, []byte{' '})
+		},
+	}
+	pprof.Cmdline(fake, r)
+}
+
 func (i *Instance) getCache(r *http.Request) interface{} {
 	return i.State.Cache(path.Base(r.URL.Path))
 }
@@ -239,11 +327,11 @@ func (i *Instance) getSession(r *http.Request) interface{} {
 	return i.State.Session(path.Base(r.URL.Path))
 }
 
-func (i Instance) getClient(r *http.Request) interface{} {
+func (i *Instance) getClient(r *http.Request) interface{} {
 	return i.State.Client(path.Base(r.URL.Path))
 }
 
-func (i Instance) getServer(r *http.Request) interface{} {
+func (i *Instance) getServer(r *http.Request) interface{} {
 	i.State.mu.Lock()
 	defer i.State.mu.Unlock()
 	id := path.Base(r.URL.Path)
@@ -255,7 +343,7 @@ func (i Instance) getServer(r *http.Request) interface{} {
 	return nil
 }
 
-func (i Instance) getView(r *http.Request) interface{} {
+func (i *Instance) getView(r *http.Request) interface{} {
 	return i.State.View(path.Base(r.URL.Path))
 }
 
@@ -280,7 +368,17 @@ func (i *Instance) getInfo(r *http.Request) interface{} {
 	return template.HTML(buf.String())
 }
 
-func getMemory(r *http.Request) interface{} {
+func (i *Instance) AddService(s protocol.Server, session *cache.Session) {
+	for _, c := range i.State.clients {
+		if c.Session == session {
+			c.Service = s
+			return
+		}
+	}
+	stdlog.Printf("unable to find a Client to add the protocol.Server to")
+}
+
+func getMemory(_ *http.Request) interface{} {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return m
@@ -315,7 +413,7 @@ func WithInstance(ctx context.Context, workdir, agent string) context.Context {
 	ocConfig.Address = i.OCAgentConfig
 	i.ocagent = ocagent.Connect(ocConfig)
 	i.prometheus = prometheus.New()
-	i.rpcs = &rpcs{}
+	i.rpcs = &Rpcs{}
 	i.traces = &traces{}
 	i.State = &State{}
 	i.exporter = makeInstanceExporter(i)
@@ -338,42 +436,52 @@ func (i *Instance) SetLogFile(logfile string, isDaemon bool) (func(), error) {
 		}
 		f, err := os.Create(logfile)
 		if err != nil {
-			return nil, fmt.Errorf("unable to create log file: %w", err)
+			return nil, errors.Errorf("unable to create log file: %w", err)
 		}
 		closeLog = func() {
 			defer f.Close()
 		}
-		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		stdlog.SetOutput(io.MultiWriter(os.Stderr, f))
 		i.LogWriter = f
 	}
 	i.Logfile = logfile
 	return closeLog, nil
 }
 
-// Serve starts and runs a debug server in the background.
+// Serve starts and runs a debug server in the background on the given addr.
 // It also logs the port the server starts on, to allow for :0 auto assigned
 // ports.
-func (i *Instance) Serve(ctx context.Context) error {
-	if i.DebugAddress == "" {
-		return nil
+func (i *Instance) Serve(ctx context.Context, addr string) (string, error) {
+	stdlog.SetFlags(stdlog.Lshortfile)
+	if addr == "" {
+		return "", nil
 	}
-	listener, err := net.Listen("tcp", i.DebugAddress)
+	i.serveMu.Lock()
+	defer i.serveMu.Unlock()
+
+	if i.listenedDebugAddress != "" {
+		// Already serving. Return the bound address.
+		return i.listenedDebugAddress, nil
+	}
+
+	i.debugAddress = addr
+	listener, err := net.Listen("tcp", i.debugAddress)
 	if err != nil {
-		return err
+		return "", err
 	}
-	i.ListenedDebugAddress = listener.Addr().String()
+	i.listenedDebugAddress = listener.Addr().String()
 
 	port := listener.Addr().(*net.TCPAddr).Port
-	if strings.HasSuffix(i.DebugAddress, ":0") {
-		log.Printf("debug server listening on port %d", port)
+	if strings.HasSuffix(i.debugAddress, ":0") {
+		stdlog.Printf("debug server listening at http://localhost:%d", port)
 	}
 	event.Log(ctx, "Debug serving", tag.Port.Of(port))
 	go func() {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/", render(mainTmpl, func(*http.Request) interface{} { return i }))
-		mux.HandleFunc("/debug/", render(debugTmpl, nil))
+		mux.HandleFunc("/", render(MainTmpl, func(*http.Request) interface{} { return i }))
+		mux.HandleFunc("/debug/", render(DebugTmpl, nil))
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/cmdline", cmdline)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
@@ -381,26 +489,38 @@ func (i *Instance) Serve(ctx context.Context) error {
 			mux.HandleFunc("/metrics/", i.prometheus.Serve)
 		}
 		if i.rpcs != nil {
-			mux.HandleFunc("/rpc/", render(rpcTmpl, i.rpcs.getData))
+			mux.HandleFunc("/rpc/", render(RPCTmpl, i.rpcs.getData))
 		}
 		if i.traces != nil {
-			mux.HandleFunc("/trace/", render(traceTmpl, i.traces.getData))
+			mux.HandleFunc("/trace/", render(TraceTmpl, i.traces.getData))
 		}
-		mux.HandleFunc("/cache/", render(cacheTmpl, i.getCache))
-		mux.HandleFunc("/session/", render(sessionTmpl, i.getSession))
-		mux.HandleFunc("/view/", render(viewTmpl, i.getView))
-		mux.HandleFunc("/client/", render(clientTmpl, i.getClient))
-		mux.HandleFunc("/server/", render(serverTmpl, i.getServer))
-		mux.HandleFunc("/file/", render(fileTmpl, i.getFile))
-		mux.HandleFunc("/info", render(infoTmpl, i.getInfo))
-		mux.HandleFunc("/memory", render(memoryTmpl, getMemory))
+		mux.HandleFunc("/cache/", render(CacheTmpl, i.getCache))
+		mux.HandleFunc("/session/", render(SessionTmpl, i.getSession))
+		mux.HandleFunc("/view/", render(ViewTmpl, i.getView))
+		mux.HandleFunc("/client/", render(ClientTmpl, i.getClient))
+		mux.HandleFunc("/server/", render(ServerTmpl, i.getServer))
+		mux.HandleFunc("/file/", render(FileTmpl, i.getFile))
+		mux.HandleFunc("/info", render(InfoTmpl, i.getInfo))
+		mux.HandleFunc("/memory", render(MemoryTmpl, getMemory))
 		if err := http.Serve(listener, mux); err != nil {
 			event.Error(ctx, "Debug server failed", err)
 			return
 		}
 		event.Log(ctx, "Debug server finished")
 	}()
-	return nil
+	return i.listenedDebugAddress, nil
+}
+
+func (i *Instance) DebugAddress() string {
+	i.serveMu.Lock()
+	defer i.serveMu.Unlock()
+	return i.debugAddress
+}
+
+func (i *Instance) ListenedDebugAddress() string {
+	i.serveMu.Lock()
+	defer i.serveMu.Unlock()
+	return i.listenedDebugAddress
 }
 
 // MonitorMemory starts recording memory statistics each second.
@@ -480,7 +600,7 @@ func makeGlobalExporter(stderr io.Writer) event.Exporter {
 
 		if event.IsLog(ev) {
 			// Don't log context cancellation errors.
-			if err := keys.Err.Get(ev); xerrors.Is(err, context.Canceled) {
+			if err := keys.Err.Get(ev); errors.Is(err, context.Canceled) {
 				return ctx
 			}
 			// Make sure any log messages without an instance go to stderr.
@@ -489,13 +609,29 @@ func makeGlobalExporter(stderr io.Writer) event.Exporter {
 				p.WriteEvent(stderr, ev, lm)
 				pMu.Unlock()
 			}
+			level := log.LabeledLevel(lm)
+			// Exclude trace logs from LSP logs.
+			if level < log.Trace {
+				ctx = protocol.LogEvent(ctx, ev, lm, messageType(level))
+			}
 		}
-		ctx = protocol.LogEvent(ctx, ev, lm)
 		if i == nil {
 			return ctx
 		}
 		return i.exporter(ctx, ev, lm)
 	}
+}
+
+func messageType(l log.Level) protocol.MessageType {
+	switch l {
+	case log.Error:
+		return protocol.Error
+	case log.Warning:
+		return protocol.Warning
+	case log.Debug:
+		return protocol.Log
+	}
+	return protocol.Info
 }
 
 func makeInstanceExporter(i *Instance) event.Exporter {
@@ -517,7 +653,7 @@ func makeInstanceExporter(i *Instance) event.Exporter {
 				i.State.addClient(s)
 			}
 			if sid := tag.NewServer.Get(ev); sid != "" {
-				i.State.addServer(&Server{
+				i.State.updateServer(&Server{
 					ID:           sid,
 					Logfile:      tag.Logfile.Get(ev),
 					DebugAddress: tag.DebugAddress.Get(ev),
@@ -540,8 +676,14 @@ func makeInstanceExporter(i *Instance) event.Exporter {
 				}
 			}
 		}
+		if b := tag.Bug.Get(ev); b != "" {
+			i.State.recordBug(b, fmt.Sprintf("%v", ev))
+		}
 		return ctx
 	}
+	// StdTrace must be above export.Spans below (by convention, export
+	// middleware applies its wrapped exporter last).
+	exporter = StdTrace(exporter)
 	metrics := metric.Config{}
 	registerMetrics(&metrics)
 	exporter = metrics.Exporter(exporter)
@@ -585,7 +727,7 @@ func fcontent(v []byte) string {
 	return string(v)
 }
 
-var baseTemplate = template.Must(template.New("").Parse(`
+var BaseTemplate = template.Must(template.New("").Parse(`
 <html>
 <head>
 <title>{{template "title" .}}</title>
@@ -624,7 +766,7 @@ Unknown page
 {{define "serverlink"}}<a href="/server/{{.}}">Server {{.}}</a>{{end}}
 {{define "sessionlink"}}<a href="/session/{{.}}">Session {{.}}</a>{{end}}
 {{define "viewlink"}}<a href="/view/{{.}}">View {{.}}</a>{{end}}
-{{define "filelink"}}<a href="/file/{{.SessionID}}/{{.Identifier}}">{{.URI}}</a>{{end}}
+{{define "filelink"}}<a href="/file/{{.Session}}/{{.FileIdentity.Hash}}">{{.FileIdentity.URI}}</a>{{end}}
 `)).Funcs(template.FuncMap{
 	"fuint64":  fuint64,
 	"fuint32":  fuint32,
@@ -649,9 +791,12 @@ Unknown page
 		}
 		return s
 	},
+	"options": func(s *cache.Session) []string {
+		return showOptions(s.Options())
+	},
 })
 
-var mainTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var MainTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls server information{{end}}
 {{define "body"}}
 <h2>Caches</h2>
@@ -664,17 +809,19 @@ var mainTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 <ul>{{range .State.Clients}}<li>{{template "clientlink" .Session.ID}}</li>{{end}}</ul>
 <h2>Servers</h2>
 <ul>{{range .State.Servers}}<li>{{template "serverlink" .ID}}</li>{{end}}</ul>
+<h2>Known bugs encountered</h2>
+<dl>{{range .State.Bugs}}<dt>{{.Description}}</dt><dd>{{.Event}}</dd>{{end}}</dl>
 {{end}}
 `))
 
-var infoTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var InfoTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls version information{{end}}
 {{define "body"}}
 {{.}}
 {{end}}
 `))
 
-var memoryTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var MemoryTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls memory usage{{end}}
 {{define "head"}}<meta http-equiv="refresh" content="5">{{end}}
 {{define "body"}}
@@ -704,14 +851,14 @@ var memoryTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 {{end}}
 `))
 
-var debugTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var DebugTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}GoPls Debug pages{{end}}
 {{define "body"}}
 <a href="/debug/pprof">Profiling</a>
 {{end}}
 `))
 
-var cacheTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var CacheTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Cache {{.ID}}{{end}}
 {{define "body"}}
 <h2>memoize.Store entries</h2>
@@ -721,17 +868,40 @@ var cacheTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
 {{end}}
 `))
 
-var clientTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ClientTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Client {{.Session.ID}}{{end}}
 {{define "body"}}
 Using session: <b>{{template "sessionlink" .Session.ID}}</b><br>
 {{if .DebugAddress}}Debug this client at: <a href="http://{{localAddress .DebugAddress}}">{{localAddress .DebugAddress}}</a><br>{{end}}
 Logfile: {{.Logfile}}<br>
 Gopls Path: {{.GoplsPath}}<br>
+<h2>Diagnostics</h2>
+{{/*Service: []protocol.Server; each server has map[uri]fileReports;
+	each fileReport: map[diagnosticSoure]diagnosticReport
+	diagnosticSource is one of 5 source
+	diagnosticReport: snapshotID and map[hash]*source.Diagnostic
+	sourceDiagnostic: struct {
+		Range    protocol.Range
+		Message  string
+		Source   string
+		Code     string
+		CodeHref string
+		Severity protocol.DiagnosticSeverity
+		Tags     []protocol.DiagnosticTag
+
+		Related []RelatedInformation
+	}
+	RelatedInformation: struct {
+		URI     span.URI
+		Range   protocol.Range
+		Message string
+	}
+	*/}}
+<ul>{{range $k, $v := .Service.Diagnostics}}<li>{{$k}}:<ol>{{range $v}}<li>{{.}}</li>{{end}}</ol></li>{{end}}</ul>
 {{end}}
 `))
 
-var serverTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ServerTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Server {{.ID}}{{end}}
 {{define "body"}}
 {{if .DebugAddress}}Debug this server at: <a href="http://{{localAddress .DebugAddress}}">{{localAddress .DebugAddress}}</a><br>{{end}}
@@ -740,18 +910,20 @@ Gopls Path: {{.GoplsPath}}<br>
 {{end}}
 `))
 
-var sessionTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var SessionTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}Session {{.ID}}{{end}}
 {{define "body"}}
 From: <b>{{template "cachelink" .Cache.ID}}</b><br>
 <h2>Views</h2>
 <ul>{{range .Views}}<li>{{.Name}} is {{template "viewlink" .ID}} in {{.Folder}}</li>{{end}}</ul>
 <h2>Overlays</h2>
-<ul>{{range .Overlays}}<li>{{template "filelink" .Identity}}</li>{{end}}</ul>
+<ul>{{range .Overlays}}<li>{{template "filelink" .}}</li>{{end}}</ul>
+<h2>Options</h2>
+{{range options .}}<p>{{.}}{{end}}
 {{end}}
 `))
 
-var viewTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
+var ViewTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
 {{define "title"}}View {{.ID}}{{end}}
 {{define "body"}}
 Name: <b>{{.Name}}</b><br>
@@ -762,17 +934,17 @@ From: <b>{{template "sessionlink" .Session.ID}}</b><br>
 {{end}}
 `))
 
-var fileTmpl = template.Must(template.Must(baseTemplate.Clone()).Parse(`
-{{define "title"}}Overlay {{.Identity.Identifier}}{{end}}
+var FileTmpl = template.Must(template.Must(BaseTemplate.Clone()).Parse(`
+{{define "title"}}Overlay {{.FileIdentity.Hash}}{{end}}
 {{define "body"}}
-{{with .Identity}}
-	From: <b>{{template "sessionlink" .SessionID}}</b><br>
+{{with .}}
+	From: <b>{{template "sessionlink" .Session}}</b><br>
 	URI: <b>{{.URI}}</b><br>
-	Identifier: <b>{{.Identifier}}</b><br>
+	Identifier: <b>{{.FileIdentity.Hash}}</b><br>
 	Version: <b>{{.Version}}</b><br>
 	Kind: <b>{{.Kind}}</b><br>
 {{end}}
 <h3>Contents</h3>
-<pre>{{fcontent .Data}}</pre>
+<pre>{{fcontent .Read}}</pre>
 {{end}}
 `))

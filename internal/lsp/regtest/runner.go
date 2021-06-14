@@ -12,13 +12,14 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	exec "golang.org/x/sys/execabs"
 
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/jsonrpc2/servertest"
@@ -27,6 +28,7 @@ import (
 	"golang.org/x/tools/internal/lsp/fake"
 	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/lsp/source"
 )
 
 // Mode is a bitmask that defines for which execution modes a test should run.
@@ -37,14 +39,13 @@ const (
 	// and communicates over pipes to mimic the gopls sidecar execution mode,
 	// which communicates over stdin/stderr.
 	Singleton Mode = 1 << iota
-
 	// Forwarded forwards connections to a shared in-process gopls instance.
 	Forwarded
 	// SeparateProcess forwards connection to a shared separate gopls process.
 	SeparateProcess
-	// NormalModes are the global default execution modes, when unmodified by
-	// test flags or by individual test options.
-	NormalModes = Singleton | Forwarded
+	// Experimental enables all of the experimental configurations that are
+	// being developed. Currently, it enables the workspace module.
+	Experimental
 )
 
 // A Runner runs tests in gopls execution environments, as specified by its
@@ -58,6 +59,7 @@ type Runner struct {
 	PrintGoroutinesOnFailure bool
 	TempDir                  string
 	SkipCleanup              bool
+	OptionsHook              func(*source.Options)
 
 	mu        sync.Mutex
 	ts        *servertest.TCPServer
@@ -68,19 +70,21 @@ type Runner struct {
 }
 
 type runConfig struct {
-	editor    fake.EditorConfig
-	sandbox   fake.SandboxConfig
-	modes     Mode
-	timeout   time.Duration
-	debugAddr string
-	skipLogs  bool
-	skipHooks bool
+	editor      fake.EditorConfig
+	sandbox     fake.SandboxConfig
+	modes       Mode
+	timeout     time.Duration
+	debugAddr   string
+	skipLogs    bool
+	skipHooks   bool
+	optionsHook func(*source.Options)
 }
 
 func (r *Runner) defaultConfig() *runConfig {
 	return &runConfig{
-		modes:   r.DefaultModes,
-		timeout: r.Timeout,
+		modes:       r.DefaultModes,
+		timeout:     r.Timeout,
+		optionsHook: r.OptionsHook,
 	}
 }
 
@@ -95,50 +99,64 @@ func (f optionSetter) set(opts *runConfig) {
 	f(opts)
 }
 
-// WithTimeout configures a custom timeout for this test run.
-func WithTimeout(d time.Duration) RunOption {
+// Timeout configures a custom timeout for this test run.
+func Timeout(d time.Duration) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.timeout = d
 	})
 }
 
-// WithProxyFiles configures a file proxy using the given txtar-encoded string.
-func WithProxyFiles(txt string) RunOption {
+// ProxyFiles configures a file proxy using the given txtar-encoded string.
+func ProxyFiles(txt string) RunOption {
 	return optionSetter(func(opts *runConfig) {
-		opts.sandbox.ProxyFiles = txt
+		opts.sandbox.ProxyFiles = fake.UnpackTxt(txt)
 	})
 }
 
-// WithModes configures the execution modes that the test should run in.
-func WithModes(modes Mode) RunOption {
+// Modes configures the execution modes that the test should run in.
+func Modes(modes Mode) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.modes = modes
 	})
 }
 
-// WithEditorConfig configures the editor's LSP session.
-func WithEditorConfig(config fake.EditorConfig) RunOption {
+// Options configures the various server and user options.
+func Options(hook func(*source.Options)) RunOption {
 	return optionSetter(func(opts *runConfig) {
-		opts.editor = config
+		old := opts.optionsHook
+		opts.optionsHook = func(o *source.Options) {
+			if old != nil {
+				old(o)
+			}
+			hook(o)
+		}
 	})
 }
 
-// WithoutWorkspaceFolders prevents workspace folders from being sent as part
-// of the sandbox's initialization. It is used to simulate opening a single
-// file in the editor, without a workspace root. In that case, the client sends
-// neither workspace folders nor a root URI.
-func WithoutWorkspaceFolders() RunOption {
+func SendPID() RunOption {
 	return optionSetter(func(opts *runConfig) {
-		opts.editor.WithoutWorkspaceFolders = true
+		opts.editor.SendPID = true
 	})
 }
 
-// WithRootPath specifies the rootURI of the workspace folder opened in the
-// editor. By default, the sandbox opens the top-level directory, but some
-// tests need to check other cases.
-func WithRootPath(path string) RunOption {
+// EditorConfig is a RunOption option that configured the regtest editor.
+type EditorConfig fake.EditorConfig
+
+func (c EditorConfig) set(opts *runConfig) {
+	opts.editor = fake.EditorConfig(c)
+}
+
+// WorkspaceFolders configures the workdir-relative workspace folders to send
+// to the LSP server. By default the editor sends a single workspace folder
+// corresponding to the workdir root. To explicitly configure no workspace
+// folders, use WorkspaceFolders with no arguments.
+func WorkspaceFolders(relFolders ...string) RunOption {
+	if len(relFolders) == 0 {
+		// Use an empty non-nil slice to signal explicitly no folders.
+		relFolders = []string{}
+	}
 	return optionSetter(func(opts *runConfig) {
-		opts.editor.EditorRootPath = path
+		opts.editor.WorkspaceFolders = relFolders
 	})
 }
 
@@ -150,14 +168,18 @@ func InGOPATH() RunOption {
 	})
 }
 
-// WithDebugAddress configures a debug server bound to addr. This option is
+// DebugAddress configures a debug server bound to addr. This option is
 // currently only supported when executing in Singleton mode. It is intended to
 // be used for long-running stress tests.
-func WithDebugAddress(addr string) RunOption {
+func DebugAddress(addr string) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.debugAddr = addr
 	})
 }
+
+var WindowsLineEndings = optionSetter(func(opts *runConfig) {
+	opts.editor.WindowsLineEndings = true
+})
 
 // SkipLogs skips the buffering of logs during test execution. It is intended
 // for long-running stress tests.
@@ -176,26 +198,26 @@ func InExistingDir(dir string) RunOption {
 	})
 }
 
-// NoHooks disables the test runner's client hooks that are used for
-// instrumenting expectations (tracking diagnostics, logs, work done, etc.). It
-// is intended for performance-sensitive stress tests.
-func NoHooks() RunOption {
+// SkipHooks allows for disabling the test runner's client hooks that are used
+// for instrumenting expectations (tracking diagnostics, logs, work done,
+// etc.). It is intended for performance-sensitive stress tests or benchmarks.
+func SkipHooks(skip bool) RunOption {
 	return optionSetter(func(opts *runConfig) {
-		opts.skipHooks = true
+		opts.skipHooks = skip
 	})
 }
 
-// WithGOPROXY configures the test environment to have an explicit proxy value.
+// GOPROXY configures the test environment to have an explicit proxy value.
 // This is intended for stress tests -- to ensure their isolation, regtests
 // should instead use WithProxyFiles.
-func WithGOPROXY(goproxy string) RunOption {
+func GOPROXY(goproxy string) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.sandbox.GOPROXY = goproxy
 	})
 }
 
-// WithLimitWorkspaceScope sets the LimitWorkspaceScope configuration.
-func WithLimitWorkspaceScope() RunOption {
+// LimitWorkspaceScope sets the LimitWorkspaceScope configuration.
+func LimitWorkspaceScope() RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.editor.LimitWorkspaceScope = true
 	})
@@ -208,15 +230,17 @@ type TestFunc func(t *testing.T, env *Env)
 // un-txtared files specified by filedata.
 func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOption) {
 	t.Helper()
+	checkBuilder(t)
 
 	tests := []struct {
 		name      string
 		mode      Mode
-		getServer func(context.Context, *testing.T) jsonrpc2.StreamServer
+		getServer func(context.Context, *testing.T, func(*source.Options)) jsonrpc2.StreamServer
 	}{
 		{"singleton", Singleton, singletonServer},
 		{"forwarded", Forwarded, r.forwardedServer},
 		{"separate_process", SeparateProcess, r.separateProcessServer},
+		{"experimental_workspace_module", Experimental, experimentalWorkspaceModule},
 	}
 
 	for _, tc := range tests {
@@ -241,17 +265,22 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 			ctx = debug.WithInstance(ctx, "", "off")
 			if config.debugAddr != "" {
 				di := debug.GetInstance(ctx)
-				di.DebugAddress = config.debugAddr
-				di.Serve(ctx)
+				di.Serve(ctx, config.debugAddr)
 				di.MonitorMemory(ctx)
 			}
 
-			tempDir := filepath.Join(r.TempDir, filepath.FromSlash(t.Name()))
-			if err := os.MkdirAll(tempDir, 0755); err != nil {
+			rootDir := filepath.Join(r.TempDir, filepath.FromSlash(t.Name()))
+			if err := os.MkdirAll(rootDir, 0755); err != nil {
 				t.Fatal(err)
 			}
+			files := fake.UnpackTxt(files)
+			if config.editor.WindowsLineEndings {
+				for name, data := range files {
+					files[name] = bytes.ReplaceAll(data, []byte("\n"), []byte("\r\n"))
+				}
+			}
 			config.sandbox.Files = files
-			config.sandbox.RootDir = tempDir
+			config.sandbox.RootDir = rootDir
 			sandbox, err := fake.NewSandbox(&config.sandbox)
 			if err != nil {
 				t.Fatal(err)
@@ -263,7 +292,7 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 			// better solution to ensure that all Go processes started by gopls have
 			// exited before we clean up.
 			r.AddCloser(sandbox)
-			ss := tc.getServer(ctx, t)
+			ss := tc.getServer(ctx, t, config.optionsHook)
 			framer := jsonrpc2.NewRawStream
 			ls := &loggingFramer{}
 			if !config.skipLogs {
@@ -280,24 +309,71 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 				}
 				env.CloseEditor()
 			}()
+			// Always await the initial workspace load.
+			env.Await(InitialWorkspaceLoad)
 			test(t, env)
 		})
 	}
 }
 
+// longBuilders maps builders that are skipped when -short is set to a
+// (possibly empty) justification.
+var longBuilders = map[string]string{
+	"openbsd-amd64-64":        "golang.org/issues/42789",
+	"openbsd-386-64":          "golang.org/issues/42789",
+	"openbsd-386-68":          "golang.org/issues/42789",
+	"openbsd-amd64-68":        "golang.org/issues/42789",
+	"darwin-amd64-10_12":      "",
+	"freebsd-amd64-race":      "",
+	"illumos-amd64":           "",
+	"netbsd-arm-bsiegert":     "",
+	"solaris-amd64-oraclerel": "",
+	"windows-arm-zx2c4":       "",
+}
+
+func checkBuilder(t *testing.T) {
+	t.Helper()
+	builder := os.Getenv("GO_BUILDER_NAME")
+	if reason, ok := longBuilders[builder]; ok && testing.Short() {
+		if reason != "" {
+			t.Skipf("Skipping %s with -short due to %s", builder, reason)
+		} else {
+			t.Skipf("Skipping %s with -short", builder)
+		}
+	}
+}
+
 type loggingFramer struct {
-	mu      sync.Mutex
-	buffers []*bytes.Buffer
+	mu  sync.Mutex
+	buf *safeBuffer
+}
+
+// safeBuffer is a threadsafe buffer for logs.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
 }
 
 func (s *loggingFramer) framer(f jsonrpc2.Framer) jsonrpc2.Framer {
 	return func(nc net.Conn) jsonrpc2.Stream {
 		s.mu.Lock()
-		var buf bytes.Buffer
-		s.buffers = append(s.buffers, &buf)
+		framed := false
+		if s.buf == nil {
+			s.buf = &safeBuffer{buf: bytes.Buffer{}}
+			framed = true
+		}
 		s.mu.Unlock()
 		stream := f(nc)
-		return protocol.LoggingStream(stream, &buf)
+		if framed {
+			return protocol.LoggingStream(stream, s.buf)
+		}
+		return stream
 	}
 }
 
@@ -305,39 +381,48 @@ func (s *loggingFramer) printBuffers(testname string, w io.Writer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i, buf := range s.buffers {
-		fmt.Fprintf(os.Stderr, "#### Start Gopls Test Logs %d of %d for %q\n", i+1, len(s.buffers), testname)
-		// Re-buffer buf to avoid a data rate (io.Copy mutates src).
-		writeBuf := bytes.NewBuffer(buf.Bytes())
-		io.Copy(w, writeBuf)
-		fmt.Fprintf(os.Stderr, "#### End Gopls Test Logs %d of %d for %q\n", i+1, len(s.buffers), testname)
+	if s.buf == nil {
+		return
 	}
+	fmt.Fprintf(os.Stderr, "#### Start Gopls Test Logs for %q\n", testname)
+	s.buf.mu.Lock()
+	io.Copy(w, &s.buf.buf)
+	s.buf.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "#### End Gopls Test Logs for %q\n", testname)
 }
 
-func singletonServer(ctx context.Context, t *testing.T) jsonrpc2.StreamServer {
-	return lsprpc.NewStreamServer(cache.New(ctx, nil), false)
+func singletonServer(ctx context.Context, t *testing.T, optsHook func(*source.Options)) jsonrpc2.StreamServer {
+	return lsprpc.NewStreamServer(cache.New(optsHook), false)
 }
 
-func (r *Runner) forwardedServer(ctx context.Context, t *testing.T) jsonrpc2.StreamServer {
-	ts := r.getTestServer()
+func experimentalWorkspaceModule(_ context.Context, _ *testing.T, optsHook func(*source.Options)) jsonrpc2.StreamServer {
+	options := func(o *source.Options) {
+		optsHook(o)
+		o.ExperimentalWorkspaceModule = true
+	}
+	return lsprpc.NewStreamServer(cache.New(options), false)
+}
+
+func (r *Runner) forwardedServer(ctx context.Context, t *testing.T, optsHook func(*source.Options)) jsonrpc2.StreamServer {
+	ts := r.getTestServer(optsHook)
 	return lsprpc.NewForwarder("tcp", ts.Addr)
 }
 
 // getTestServer gets the shared test server instance to connect to, or creates
 // one if it doesn't exist.
-func (r *Runner) getTestServer() *servertest.TCPServer {
+func (r *Runner) getTestServer(optsHook func(*source.Options)) *servertest.TCPServer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ts == nil {
 		ctx := context.Background()
 		ctx = debug.WithInstance(ctx, "", "off")
-		ss := lsprpc.NewStreamServer(cache.New(ctx, nil), false)
+		ss := lsprpc.NewStreamServer(cache.New(optsHook), false)
 		r.ts = servertest.NewTCPServer(ctx, ss, nil)
 	}
 	return r.ts
 }
 
-func (r *Runner) separateProcessServer(ctx context.Context, t *testing.T) jsonrpc2.StreamServer {
+func (r *Runner) separateProcessServer(ctx context.Context, t *testing.T, optsHook func(*source.Options)) jsonrpc2.StreamServer {
 	// TODO(rfindley): can we use the autostart behavior here, instead of
 	// pre-starting the remote?
 	socket := r.getRemoteSocket(t)

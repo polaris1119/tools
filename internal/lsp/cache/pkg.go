@@ -6,9 +6,10 @@ package cache
 
 import (
 	"go/ast"
+	"go/scanner"
 	"go/types"
 
-	"golang.org/x/tools/go/packages"
+	"golang.org/x/mod/module"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
@@ -20,13 +21,15 @@ type pkg struct {
 	mode            source.ParseMode
 	goFiles         []*source.ParsedGoFile
 	compiledGoFiles []*source.ParsedGoFile
-	errors          []*source.Error
+	diagnostics     []*source.Diagnostic
 	imports         map[packagePath]*pkg
-	module          *packages.Module
+	version         *module.Version
+	parseErrors     []scanner.ErrorList
 	typeErrors      []types.Error
 	types           *types.Package
 	typesInfo       *types.Info
 	typesSizes      types.Sizes
+	hasFixedFiles   bool
 }
 
 // Declare explicit types for package paths, names, and IDs to ensure that we
@@ -41,9 +44,9 @@ type (
 
 // Declare explicit types for files and directories to distinguish between the two.
 type (
-	fileURI       span.URI
-	directoryURI  span.URI
-	viewLoadScope span.URI
+	fileURI         span.URI
+	moduleLoadScope string
+	viewLoadScope   span.URI
 )
 
 func (p *pkg) ID() string {
@@ -84,10 +87,6 @@ func (p *pkg) GetSyntax() []*ast.File {
 	return syntax
 }
 
-func (p *pkg) GetErrors() []*source.Error {
-	return p.errors
-}
-
 func (p *pkg) GetTypes() *types.Package {
 	return p.types
 }
@@ -117,9 +116,20 @@ func (p *pkg) GetImport(pkgPath string) (source.Package, error) {
 }
 
 func (p *pkg) MissingDependencies() []string {
+	// We don't invalidate metadata for import deletions, so check the package
+	// imports via the *types.Package. Only use metadata if p.types is nil.
+	if p.types == nil {
+		var md []string
+		for i := range p.m.missingDeps {
+			md = append(md, string(i))
+		}
+		return md
+	}
 	var md []string
-	for i := range p.m.missingDeps {
-		md = append(md, string(i))
+	for _, pkg := range p.types.Imports() {
+		if _, ok := p.m.missingDeps[packagePath(pkg.Path())]; ok {
+			md = append(md, pkg.Path())
+		}
 	}
 	return md
 }
@@ -132,6 +142,14 @@ func (p *pkg) Imports() []source.Package {
 	return result
 }
 
-func (p *pkg) Module() *packages.Module {
-	return p.module
+func (p *pkg) Version() *module.Version {
+	return p.version
+}
+
+func (p *pkg) HasListOrParseErrors() bool {
+	return len(p.m.errors) != 0 || len(p.parseErrors) != 0
+}
+
+func (p *pkg) HasTypeErrors() bool {
+	return len(p.typeErrors) != 0
 }

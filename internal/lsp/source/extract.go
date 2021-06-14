@@ -21,8 +21,8 @@ import (
 	"golang.org/x/tools/internal/span"
 )
 
-func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, pkg *types.Package, info *types.Info) (*analysis.SuggestedFix, error) {
-	expr, path, ok, err := canExtractVariable(rng, file)
+func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, _ *types.Package, info *types.Info) (*analysis.SuggestedFix, error) {
+	expr, path, ok, err := CanExtractVariable(rng, file)
 	if !ok {
 		return nil, fmt.Errorf("extractVariable: cannot extract %s: %v", fset.Position(rng.Start), err)
 	}
@@ -31,23 +31,25 @@ func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	var lhsNames []string
 	switch expr := expr.(type) {
 	// TODO: stricter rules for selectorExpr.
-	case *ast.BasicLit, *ast.CompositeLit, *ast.IndexExpr, *ast.SliceExpr, *ast.UnaryExpr,
-		*ast.BinaryExpr, *ast.SelectorExpr:
-		lhsNames = append(lhsNames,
-			generateAvailableIdentifier(expr.Pos(), file, path, info, "x", 0))
+	case *ast.BasicLit, *ast.CompositeLit, *ast.IndexExpr, *ast.SliceExpr,
+		*ast.UnaryExpr, *ast.BinaryExpr, *ast.SelectorExpr:
+		lhsName, _ := generateAvailableIdentifier(expr.Pos(), file, path, info, "x", 0)
+		lhsNames = append(lhsNames, lhsName)
 	case *ast.CallExpr:
 		tup, ok := info.TypeOf(expr).(*types.Tuple)
 		if !ok {
 			// If the call expression only has one return value, we can treat it the
 			// same as our standard extract variable case.
-			lhsNames = append(lhsNames,
-				generateAvailableIdentifier(expr.Pos(), file, path, info, "x", 0))
+			lhsName, _ := generateAvailableIdentifier(expr.Pos(), file, path, info, "x", 0)
+			lhsNames = append(lhsNames, lhsName)
 			break
 		}
+		idx := 0
 		for i := 0; i < tup.Len(); i++ {
 			// Generate a unique variable for each return value.
-			lhsNames = append(lhsNames,
-				generateAvailableIdentifier(expr.Pos(), file, path, info, "x", i))
+			var lhsName string
+			lhsName, idx = generateAvailableIdentifier(expr.Pos(), file, path, info, "x", idx)
+			lhsNames = append(lhsNames, lhsName)
 		}
 	default:
 		return nil, fmt.Errorf("cannot extract %T", expr)
@@ -91,15 +93,20 @@ func extractVariable(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	}, nil
 }
 
-// canExtractVariable reports whether the code in the given range can be
+// CanExtractVariable reports whether the code in the given range can be
 // extracted to a variable.
-func canExtractVariable(rng span.Range, file *ast.File) (ast.Expr, []ast.Node, bool, error) {
+func CanExtractVariable(rng span.Range, file *ast.File) (ast.Expr, []ast.Node, bool, error) {
 	if rng.Start == rng.End {
 		return nil, nil, false, fmt.Errorf("start and end are equal")
 	}
 	path, _ := astutil.PathEnclosingInterval(file, rng.Start, rng.End)
 	if len(path) == 0 {
 		return nil, nil, false, fmt.Errorf("no path enclosing interval")
+	}
+	for _, n := range path {
+		if _, ok := n.(*ast.ImportSpec); ok {
+			return nil, nil, false, fmt.Errorf("cannot extract variable in an import block")
+		}
 	}
 	node := path[0]
 	if rng.Start != node.Pos() || rng.End != node.End() {
@@ -129,15 +136,18 @@ func calculateIndentation(content []byte, tok *token.File, insertBeforeStmt ast.
 }
 
 // generateAvailableIdentifier adjusts the new function name until there are no collisons in scope.
-// Possible collisions include other function and variable names.
-func generateAvailableIdentifier(pos token.Pos, file *ast.File, path []ast.Node, info *types.Info, prefix string, idx int) string {
-	scopes := collectScopes(info, path, pos)
-	name := prefix + fmt.Sprintf("%d", idx)
+// Possible collisions include other function and variable names. Returns the next index to check for prefix.
+func generateAvailableIdentifier(pos token.Pos, file *ast.File, path []ast.Node, info *types.Info, prefix string, idx int) (string, int) {
+	scopes := CollectScopes(info, path, pos)
+	name := prefix
+	if idx != 0 {
+		name += fmt.Sprintf("%d", idx)
+	}
 	for file.Scope.Lookup(name) != nil || !isValidName(name, scopes) {
 		idx++
 		name = fmt.Sprintf("%v%d", prefix, idx)
 	}
-	return name
+	return name, idx + 1
 }
 
 // isValidName checks for variable collision in scope.
@@ -171,16 +181,17 @@ type returnVariable struct {
 // It also replaces the selected block of code with a call to the extracted
 // function. First, we manually adjust the selection range. We remove trailing
 // and leading whitespace characters to ensure the range is precisely bounded
-// by AST nodes. Next, we determine the variables that will be the paramters
+// by AST nodes. Next, we determine the variables that will be the parameters
 // and return values of the extracted function. Lastly, we construct the call
 // of the function and insert this call as well as the extracted function into
 // their proper locations.
 func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, pkg *types.Package, info *types.Info) (*analysis.SuggestedFix, error) {
-	tok, path, rng, outer, start, ok, err := canExtractFunction(fset, rng, src, file, info)
+	p, ok, err := CanExtractFunction(fset, rng, src, file)
 	if !ok {
 		return nil, fmt.Errorf("extractFunction: cannot extract %s: %v",
 			fset.Position(rng.Start), err)
 	}
+	tok, path, rng, outer, start := p.tok, p.path, p.rng, p.outer, p.start
 	fileScope := info.Scopes[file]
 	if fileScope == nil {
 		return nil, fmt.Errorf("extractFunction: file scope is empty")
@@ -190,11 +201,9 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 		return nil, fmt.Errorf("extractFunction: package scope is empty")
 	}
 
-	// TODO: Support non-nested return statements.
 	// A return statement is non-nested if its parent node is equal to the parent node
-	// of the first node in the selection. These cases must be handled seperately because
-	// non-nested return statements are guaranteed to execute. Our control flow does not
-	// properly consider these situations yet.
+	// of the first node in the selection. These cases must be handled separately because
+	// non-nested return statements are guaranteed to execute.
 	var retStmts []*ast.ReturnStmt
 	var hasNonNestedReturn bool
 	startParent := findParent(outer, start)
@@ -211,22 +220,20 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 		}
 		if findParent(outer, n) == startParent {
 			hasNonNestedReturn = true
-			return false
 		}
 		retStmts = append(retStmts, ret)
 		return false
 	})
-	if hasNonNestedReturn {
-		return nil, fmt.Errorf("extractFunction: selected block contains non-nested return")
-	}
 	containsReturnStatement := len(retStmts) > 0
 
 	// Now that we have determined the correct range for the selection block,
 	// we must determine the signature of the extracted function. We will then replace
 	// the block with an assignment statement that calls the extracted function with
 	// the appropriate parameters and return values.
-	free, vars, assigned, defined := collectFreeVars(
-		info, file, fileScope, pkgScope, rng, path[0])
+	variables, err := collectFreeVars(info, file, fileScope, pkgScope, rng, path[0])
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		params, returns         []ast.Expr     // used when calling the extracted function
@@ -241,7 +248,7 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	// Some variables on the left-hand side of our assignment statement may be free. If our
 	// selection begins in the same scope in which the free variable is defined, we can
 	// redefine it in our assignment statement. See the following example, where 'b' and
-	// 'err' (both free variables) can be redefined in the second funcCall() while maintaing
+	// 'err' (both free variables) can be redefined in the second funcCall() while maintaining
 	// correctness.
 	//
 	//
@@ -265,42 +272,42 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	// variable in the extracted function. Determine the outcome(s) for each variable
 	// based on whether it is free, altered within the selected block, and used outside
 	// of the selected block.
-	for _, obj := range vars {
-		if _, ok := seenVars[obj]; ok {
+	for _, v := range variables {
+		if _, ok := seenVars[v.obj]; ok {
 			continue
 		}
-		typ := analysisinternal.TypeExpr(fset, file, pkg, obj.Type())
-		if typ == nil {
-			return nil, fmt.Errorf("nil AST expression for type: %v", obj.Name())
+		if v.obj.Name() == "_" {
+			// The blank identifier is always a local variable
+			continue
 		}
-		seenVars[obj] = typ
-		identifier := ast.NewIdent(obj.Name())
+		typ := analysisinternal.TypeExpr(fset, file, pkg, v.obj.Type())
+		if typ == nil {
+			return nil, fmt.Errorf("nil AST expression for type: %v", v.obj.Name())
+		}
+		seenVars[v.obj] = typ
+		identifier := ast.NewIdent(v.obj.Name())
 		// An identifier must meet three conditions to become a return value of the
 		// extracted function. (1) its value must be defined or reassigned within
 		// the selection (isAssigned), (2) it must be used at least once after the
 		// selection (isUsed), and (3) its first use after the selection
 		// cannot be its own reassignment or redefinition (objOverriden).
-		if obj.Parent() == nil {
+		if v.obj.Parent() == nil {
 			return nil, fmt.Errorf("parent nil")
 		}
-		isUsed, firstUseAfter :=
-			objUsed(info, span.NewRange(fset, rng.End, obj.Parent().End()), obj)
-		_, isAssigned := assigned[obj]
-		_, isFree := free[obj]
-		if isAssigned && isUsed && !varOverridden(info, firstUseAfter, obj, isFree, outer) {
+		isUsed, firstUseAfter := objUsed(info, span.NewRange(fset, rng.End, v.obj.Parent().End()), v.obj)
+		if v.assigned && isUsed && !varOverridden(info, firstUseAfter, v.obj, v.free, outer) {
 			returnTypes = append(returnTypes, &ast.Field{Type: typ})
 			returns = append(returns, identifier)
-			if !isFree {
-				uninitialized = append(uninitialized, obj)
-			} else if obj.Parent().Pos() == startParent.Pos() {
+			if !v.free {
+				uninitialized = append(uninitialized, v.obj)
+			} else if v.obj.Parent().Pos() == startParent.Pos() {
 				canRedefineCount++
 			}
 		}
-		_, isDefined := defined[obj]
 		// An identifier must meet two conditions to become a parameter of the
 		// extracted function. (1) it must be free (isFree), and (2) its first
 		// use within the selection cannot be its own definition (isDefined).
-		if isFree && !isDefined {
+		if v.free && !v.defined {
 			params = append(params, identifier)
 			paramTypes = append(paramTypes, &ast.Field{
 				Names: []*ast.Ident{identifier},
@@ -389,24 +396,54 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	// in the original function. If the condition is met, the original function should
 	// return a value, mimicking the functionality of the original return statement(s)
 	// in the selection.
+	//
+	// If there is a return that is guaranteed to execute (hasNonNestedReturns=true), then
+	// we don't need to include this additional condition check and can simply return.
+	//
+	// Before:
+	//
+	// func _() int {
+	//     a := 1
+	//     b := 2
+	//     **if a == b {
+	//         return a
+	//     }
+	//	   return b**
+	// }
+	//
+	// After:
+	//
+	// func _() int {
+	//     a := 1
+	//     b := 2
+	//     return x0(a, b)
+	// }
+	//
+	// func x0(a int, b int) int {
+	//     if a == b {
+	//         return a
+	//     }
+	//     return b
+	// }
 
 	var retVars []*returnVariable
 	var ifReturn *ast.IfStmt
 	if containsReturnStatement {
-		// The selected block contained return statements, so we have to modify the
-		// signature of the extracted function as described above. Adjust all of
-		// the return statements in the extracted function to reflect this change in
-		// signature.
-		if err := adjustReturnStatements(returnTypes, seenVars, fset, file,
-			pkg, extractedBlock); err != nil {
-			return nil, err
+		if !hasNonNestedReturn {
+			// The selected block contained return statements, so we have to modify the
+			// signature of the extracted function as described above. Adjust all of
+			// the return statements in the extracted function to reflect this change in
+			// signature.
+			if err := adjustReturnStatements(returnTypes, seenVars, fset, file,
+				pkg, extractedBlock); err != nil {
+				return nil, err
+			}
 		}
-		// Collect the additional return values and types needed to accomodate return
+		// Collect the additional return values and types needed to accommodate return
 		// statements in the selection. Update the type signature of the extracted
 		// function and construct the if statement that will be inserted in the enclosing
 		// function.
-		retVars, ifReturn, err = generateReturnInfo(
-			enclosing, pkg, path, file, info, fset, rng.Start)
+		retVars, ifReturn, err = generateReturnInfo(enclosing, pkg, path, file, info, fset, rng.Start, hasNonNestedReturn)
 		if err != nil {
 			return nil, err
 		}
@@ -415,8 +452,10 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	// Add a return statement to the end of the new function. This return statement must include
 	// the values for the types of the original extracted function signature and (if a return
 	// statement is present in the selection) enclosing function signature.
+	// This only needs to be done if the selections does not have a non-nested return, otherwise
+	// it already terminates with a return statement.
 	hasReturnValues := len(returns)+len(retVars) > 0
-	if hasReturnValues {
+	if hasReturnValues && !hasNonNestedReturn {
 		extractedBlock.List = append(extractedBlock.List, &ast.ReturnStmt{
 			Results: append(returns, getZeroVals(retVars)...),
 		})
@@ -432,8 +471,8 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	if canDefine {
 		sym = token.DEFINE
 	}
-	funName := generateAvailableIdentifier(rng.Start, file, path, info, "fn", 0)
-	extractedFunCall := generateFuncCall(hasReturnValues, params,
+	funName, _ := generateAvailableIdentifier(rng.Start, file, path, info, "newFunction", 0)
+	extractedFunCall := generateFuncCall(hasNonNestedReturn, hasReturnValues, params,
 		append(returns, getNames(retVars)...), funName, sym)
 
 	// Build the extracted function.
@@ -454,7 +493,7 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 		declarations = initializeVars(uninitialized, retVars, seenUninitialized, seenVars)
 	}
 
-	var declBuf, replaceBuf, newFuncBuf, ifBuf bytes.Buffer
+	var declBuf, replaceBuf, newFuncBuf, ifBuf, commentBuf bytes.Buffer
 	if err := format.Node(&declBuf, fset, declarations); err != nil {
 		return nil, err
 	}
@@ -469,6 +508,15 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	if err := format.Node(&newFuncBuf, fset, newFunc); err != nil {
 		return nil, err
 	}
+	// Find all the comments within the range and print them to be put somewhere.
+	// TODO(suzmue): print these in the extracted function at the correct place.
+	for _, cg := range file.Comments {
+		if cg.Pos().IsValid() && cg.Pos() < rng.End && cg.Pos() >= rng.Start {
+			for _, c := range cg.List {
+				fmt.Fprintln(&commentBuf, c.Text)
+			}
+		}
+	}
 
 	// We're going to replace the whole enclosing function,
 	// so preserve the text before and after the selected block.
@@ -480,6 +528,10 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 
 	var fullReplacement strings.Builder
 	fullReplacement.Write(before)
+	if commentBuf.Len() > 0 {
+		comments := strings.ReplaceAll(commentBuf.String(), "\n", newLineIndent)
+		fullReplacement.WriteString(comments)
+	}
 	if declBuf.Len() > 0 { // add any initializations, if needed
 		initializations := strings.ReplaceAll(declBuf.String(), "\n", newLineIndent) +
 			newLineIndent
@@ -496,13 +548,11 @@ func extractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.
 	fullReplacement.Write(newFuncBuf.Bytes()) // insert the extracted function
 
 	return &analysis.SuggestedFix{
-		TextEdits: []analysis.TextEdit{
-			{
-				Pos:     outer.Pos(),
-				End:     outer.End(),
-				NewText: []byte(fullReplacement.String()),
-			},
-		},
+		TextEdits: []analysis.TextEdit{{
+			Pos:     outer.Pos(),
+			End:     outer.End(),
+			NewText: []byte(fullReplacement.String()),
+		}},
 	}, nil
 }
 
@@ -557,15 +607,28 @@ func findParent(start ast.Node, target ast.Node) ast.Node {
 	return parent
 }
 
+// variable describes the status of a variable within a selection.
+type variable struct {
+	obj types.Object
+
+	// free reports whether the variable is a free variable, meaning it should
+	// be a parameter to the extracted function.
+	free bool
+
+	// assigned reports whether the variable is assigned to in the selection.
+	assigned bool
+
+	// defined reports whether the variable is defined in the selection.
+	defined bool
+}
+
 // collectFreeVars maps each identifier in the given range to whether it is "free."
 // Given a range, a variable in that range is defined as "free" if it is declared
 // outside of the range and neither at the file scope nor package scope. These free
 // variables will be used as arguments in the extracted function. It also returns a
 // list of identifiers that may need to be returned by the extracted function.
 // Some of the code in this function has been adapted from tools/cmd/guru/freevars.go.
-func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
-	pkgScope *types.Scope, rng span.Range, node ast.Node) (map[types.Object]struct{},
-	[]types.Object, map[types.Object]struct{}, map[types.Object]struct{}) {
+func collectFreeVars(info *types.Info, file *ast.File, fileScope, pkgScope *types.Scope, rng span.Range, node ast.Node) ([]*variable, error) {
 	// id returns non-nil if n denotes an object that is referenced by the span
 	// and defined either within the span or in the lexical environment. The bool
 	// return value acts as an indicator for where it was defined.
@@ -608,7 +671,7 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 		}
 		return nil, false
 	}
-	free := make(map[types.Object]struct{})
+	seen := make(map[types.Object]*variable)
 	firstUseIn := make(map[types.Object]token.Pos)
 	var vars []types.Object
 	ast.Inspect(node, func(n ast.Node) bool {
@@ -626,15 +689,16 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 				prune = true
 			}
 			if obj != nil {
-				if isFree {
-					free[obj] = struct{}{}
+				seen[obj] = &variable{
+					obj:  obj,
+					free: isFree,
 				}
+				vars = append(vars, obj)
 				// Find the first time that the object is used in the selection.
 				first, ok := firstUseIn[obj]
 				if !ok || n.Pos() < first {
 					firstUseIn[obj] = n.Pos()
 				}
-				vars = append(vars, obj)
 				if prune {
 					return false
 				}
@@ -653,8 +717,6 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 	// 3: y := 3
 	// 4: z := x + a
 	//
-	assigned := make(map[types.Object]struct{})
-	defined := make(map[types.Object]struct{})
 	ast.Inspect(node, func(n ast.Node) bool {
 		if n == nil {
 			return false
@@ -673,7 +735,10 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 				if obj == nil {
 					continue
 				}
-				assigned[obj] = struct{}{}
+				if _, ok := seen[obj]; !ok {
+					continue
+				}
+				seen[obj].assigned = true
 				if n.Tok != token.DEFINE {
 					continue
 				}
@@ -693,7 +758,10 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 					if referencesObj(info, expr, obj) {
 						continue
 					}
-					defined[obj] = struct{}{}
+					if _, ok := seen[obj]; !ok {
+						continue
+					}
+					seen[obj].defined = true
 					break
 				}
 			}
@@ -713,7 +781,10 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 					if obj == nil {
 						continue
 					}
-					assigned[obj] = struct{}{}
+					if _, ok := seen[obj]; !ok {
+						continue
+					}
+					seen[obj].assigned = true
 				}
 			}
 			return false
@@ -723,12 +794,23 @@ func collectFreeVars(info *types.Info, file *ast.File, fileScope *types.Scope,
 			} else if obj, _ := id(ident); obj == nil {
 				return false
 			} else {
-				assigned[obj] = struct{}{}
+				if _, ok := seen[obj]; !ok {
+					return false
+				}
+				seen[obj].assigned = true
 			}
 		}
 		return true
 	})
-	return free, vars, assigned, defined
+	var variables []*variable
+	for _, obj := range vars {
+		v, ok := seen[obj]
+		if !ok {
+			return nil, fmt.Errorf("no seen types.Object for %v", obj)
+		}
+		variables = append(variables, v)
+	}
+	return variables, nil
 }
 
 // referencesObj checks whether the given object appears in the given expression.
@@ -752,29 +834,34 @@ func referencesObj(info *types.Info, expr ast.Expr, obj types.Object) bool {
 	return hasObj
 }
 
-// canExtractFunction reports whether the code in the given range can be extracted to a function.
-func canExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, info *types.Info) (*token.File, []ast.Node, span.Range, *ast.FuncDecl, ast.Node, bool, error) {
+type fnExtractParams struct {
+	tok   *token.File
+	path  []ast.Node
+	rng   span.Range
+	outer *ast.FuncDecl
+	start ast.Node
+}
+
+// CanExtractFunction reports whether the code in the given range can be
+// extracted to a function.
+func CanExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *ast.File) (*fnExtractParams, bool, error) {
 	if rng.Start == rng.End {
-		return nil, nil, span.Range{}, nil, nil, false,
-			fmt.Errorf("start and end are equal")
+		return nil, false, fmt.Errorf("start and end are equal")
 	}
 	tok := fset.File(file.Pos())
 	if tok == nil {
-		return nil, nil, span.Range{}, nil, nil, false,
-			fmt.Errorf("no file for pos %v", fset.Position(file.Pos()))
+		return nil, false, fmt.Errorf("no file for pos %v", fset.Position(file.Pos()))
 	}
 	rng = adjustRangeForWhitespace(rng, tok, src)
 	path, _ := astutil.PathEnclosingInterval(file, rng.Start, rng.End)
 	if len(path) == 0 {
-		return nil, nil, span.Range{}, nil, nil, false,
-			fmt.Errorf("no path enclosing interval")
+		return nil, false, fmt.Errorf("no path enclosing interval")
 	}
 	// Node that encloses the selection must be a statement.
 	// TODO: Support function extraction for an expression.
 	_, ok := path[0].(ast.Stmt)
 	if !ok {
-		return nil, nil, span.Range{}, nil, nil, false,
-			fmt.Errorf("node is not a statement")
+		return nil, false, fmt.Errorf("node is not a statement")
 	}
 
 	// Find the function declaration that encloses the selection.
@@ -786,7 +873,7 @@ func canExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *a
 		}
 	}
 	if outer == nil {
-		return nil, nil, span.Range{}, nil, nil, false, fmt.Errorf("no enclosing function")
+		return nil, false, fmt.Errorf("no enclosing function")
 	}
 
 	// Find the nodes at the start and end of the selection.
@@ -795,8 +882,8 @@ func canExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *a
 		if n == nil {
 			return false
 		}
-		// Do not override 'start' with a node that begins at the same location but is
-		// nested further from 'outer'.
+		// Do not override 'start' with a node that begins at the same location
+		// but is nested further from 'outer'.
 		if start == nil && n.Pos() == rng.Start && n.End() <= rng.End {
 			start = n
 		}
@@ -806,14 +893,19 @@ func canExtractFunction(fset *token.FileSet, rng span.Range, src []byte, file *a
 		return n.Pos() <= rng.End
 	})
 	if start == nil || end == nil {
-		return nil, nil, span.Range{}, nil, nil, false,
-			fmt.Errorf("range does not map to AST nodes")
+		return nil, false, fmt.Errorf("range does not map to AST nodes")
 	}
-	return tok, path, rng, outer, start, true, nil
+	return &fnExtractParams{
+		tok:   tok,
+		path:  path,
+		rng:   rng,
+		outer: outer,
+		start: start,
+	}, true, nil
 }
 
-// objUsed checks if the object is used within the range. It returns the first occurence of
-// the object in the range, if it exists.
+// objUsed checks if the object is used within the range. It returns the first
+// occurrence of the object in the range, if it exists.
 func objUsed(info *types.Info, rng span.Range, obj types.Object) (bool, *ast.Ident) {
 	var firstUse *ast.Ident
 	for id, objUse := range info.Uses {
@@ -905,19 +997,23 @@ func parseBlockStmt(fset *token.FileSet, src []byte) (*ast.BlockStmt, error) {
 // signature of the extracted function. We prepare names, signatures, and "zero values" that
 // represent the new variables. We also use this information to construct the if statement that
 // is inserted below the call to the extracted function.
-func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.Node, file *ast.File, info *types.Info, fset *token.FileSet, pos token.Pos) ([]*returnVariable, *ast.IfStmt, error) {
-	// Generate information for the added bool value.
-	cond := &ast.Ident{Name: generateAvailableIdentifier(pos, file, path, info, "cond", 0)}
-	retVars := []*returnVariable{
-		{
+func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.Node, file *ast.File, info *types.Info, fset *token.FileSet, pos token.Pos, hasNonNestedReturns bool) ([]*returnVariable, *ast.IfStmt, error) {
+	var retVars []*returnVariable
+	var cond *ast.Ident
+	if !hasNonNestedReturns {
+		// Generate information for the added bool value.
+		name, _ := generateAvailableIdentifier(pos, file, path, info, "shouldReturn", 0)
+		cond = &ast.Ident{Name: name}
+		retVars = append(retVars, &returnVariable{
 			name:    cond,
 			decl:    &ast.Field{Type: ast.NewIdent("bool")},
 			zeroVal: ast.NewIdent("false"),
-		},
+		})
 	}
 	// Generate information for the values in the return signature of the enclosing function.
 	if enclosing.Results != nil {
-		for i, field := range enclosing.Results.List {
+		idx := 0
+		for _, field := range enclosing.Results.List {
 			typ := info.TypeOf(field.Type)
 			if typ == nil {
 				return nil, nil, fmt.Errorf(
@@ -927,22 +1023,27 @@ func generateReturnInfo(enclosing *ast.FuncType, pkg *types.Package, path []ast.
 			if expr == nil {
 				return nil, nil, fmt.Errorf("nil AST expression")
 			}
+			var name string
+			name, idx = generateAvailableIdentifier(pos, file,
+				path, info, "returnValue", idx)
 			retVars = append(retVars, &returnVariable{
-				name: ast.NewIdent(generateAvailableIdentifier(pos, file,
-					path, info, "ret", i)),
+				name: ast.NewIdent(name),
 				decl: &ast.Field{Type: expr},
 				zeroVal: analysisinternal.ZeroValue(
 					fset, file, pkg, typ),
 			})
 		}
 	}
-	// Create the return statement for the enclosing function. We must exclude the variable
-	// for the condition of the if statement (cond) from the return statement.
-	ifReturn := &ast.IfStmt{
-		Cond: cond,
-		Body: &ast.BlockStmt{
-			List: []ast.Stmt{&ast.ReturnStmt{Results: getNames(retVars)[1:]}},
-		},
+	var ifReturn *ast.IfStmt
+	if !hasNonNestedReturns {
+		// Create the return statement for the enclosing function. We must exclude the variable
+		// for the condition of the if statement (cond) from the return statement.
+		ifReturn = &ast.IfStmt{
+			Cond: cond,
+			Body: &ast.BlockStmt{
+				List: []ast.Stmt{&ast.ReturnStmt{Results: getNames(retVars)[1:]}},
+			},
+		}
 	}
 	return retVars, ifReturn, nil
 }
@@ -988,17 +1089,26 @@ func adjustReturnStatements(returnTypes []*ast.Field, seenVars map[types.Object]
 
 // generateFuncCall constructs a call expression for the extracted function, described by the
 // given parameters and return variables.
-func generateFuncCall(hasReturnVals bool, params, returns []ast.Expr, name string, token token.Token) ast.Node {
+func generateFuncCall(hasNonNestedReturn, hasReturnVals bool, params, returns []ast.Expr, name string, token token.Token) ast.Node {
 	var replace ast.Node
 	if hasReturnVals {
 		callExpr := &ast.CallExpr{
 			Fun:  ast.NewIdent(name),
 			Args: params,
 		}
-		replace = &ast.AssignStmt{
-			Lhs: returns,
-			Tok: token,
-			Rhs: []ast.Expr{callExpr},
+		if hasNonNestedReturn {
+			// Create a return statement that returns the result of the function call.
+			replace = &ast.ReturnStmt{
+				Return:  0,
+				Results: []ast.Expr{callExpr},
+			}
+		} else {
+			// Assign the result of the function call.
+			replace = &ast.AssignStmt{
+				Lhs: returns,
+				Tok: token,
+				Rhs: []ast.Expr{callExpr},
+			}
 		}
 	} else {
 		replace = &ast.CallExpr{

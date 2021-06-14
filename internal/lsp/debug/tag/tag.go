@@ -19,7 +19,7 @@ var (
 	File          = keys.NewString("file", "")
 	Directory     = keys.New("directory", "")
 	URI           = keys.New("URI", "")
-	Package       = keys.NewString("package", "")
+	Package       = keys.NewString("package", "") // Package ID
 	PackagePath   = keys.NewString("package_path", "")
 	Query         = keys.New("query", "")
 	Snapshot      = keys.NewUInt64("snapshot", "")
@@ -41,6 +41,12 @@ var (
 	DebugAddress = keys.NewString("debug_address", "")
 	GoplsPath    = keys.NewString("gopls_path", "")
 	ClientID     = keys.NewString("client_id", "")
+
+	Level = keys.NewInt("level", "The logging level")
+
+	// Bug tracks occurrences of known bugs in the server.
+	Bug      = keys.NewString("bug", "A bug has occurred")
+	Callsite = keys.NewString("callsite", "gopls function call site")
 )
 
 var (

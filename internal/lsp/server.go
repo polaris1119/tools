@@ -14,21 +14,24 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 const concurrentAnalyses = 1
 
 // NewServer creates an LSP server and binds it to handle incoming client
 // messages on on the supplied stream.
-func NewServer(session source.Session, client protocol.Client) *Server {
+func NewServer(session source.Session, client protocol.ClientCloser) *Server {
 	return &Server{
-		delivered:            make(map[span.URI]sentDiagnostics),
-		gcOptimizatonDetails: make(map[span.URI]struct{}),
-		watchedDirectories:   make(map[span.URI]struct{}),
-		session:              session,
-		client:               client,
-		diagnosticsSema:      make(chan struct{}, concurrentAnalyses),
-		progress:             newProgressTracker(client),
+		diagnostics:           map[span.URI]*fileReports{},
+		gcOptimizationDetails: make(map[string]struct{}),
+		watchedGlobPatterns:   make(map[string]struct{}),
+		changedFiles:          make(map[span.URI]struct{}),
+		session:               session,
+		client:                client,
+		diagnosticsSema:       make(chan struct{}, concurrentAnalyses),
+		progress:              newProgressTracker(client),
+		debouncer:             newDebouncer(),
 	}
 }
 
@@ -57,12 +60,16 @@ func (s serverState) String() string {
 
 // Server implements the protocol.Server interface.
 type Server struct {
-	client protocol.Client
+	client protocol.ClientCloser
 
 	stateMu sync.Mutex
 	state   serverState
+	// notifications generated before serverInitialized
+	notifications []*protocol.ShowMessageParams
 
 	session source.Session
+
+	tempDir string
 
 	// changedFiles tracks files for which there has been a textDocument/didChange.
 	changedFilesMu sync.Mutex
@@ -72,40 +79,45 @@ type Server struct {
 	// set of folders to build views for when we are ready
 	pendingFolders []protocol.WorkspaceFolder
 
-	// watchedDirectories is the set of directories that we have requested that
+	// watchedGlobPatterns is the set of glob patterns that we have requested
 	// the client watch on disk. It will be updated as the set of directories
 	// that the server should watch changes.
-	watchedDirectoriesMu   sync.Mutex
-	watchedDirectories     map[span.URI]struct{}
-	watchRegistrationCount uint64
+	watchedGlobPatternsMu  sync.Mutex
+	watchedGlobPatterns    map[string]struct{}
+	watchRegistrationCount int
 
-	// delivered is a cache of the diagnostics that the server has sent.
-	deliveredMu sync.Mutex
-	delivered   map[span.URI]sentDiagnostics
+	diagnosticsMu sync.Mutex
+	diagnostics   map[span.URI]*fileReports
 
 	// gcOptimizationDetails describes the packages for which we want
 	// optimization details to be included in the diagnostics. The key is the
-	// directory of the package.
+	// ID of the package.
 	gcOptimizationDetailsMu sync.Mutex
-	gcOptimizatonDetails    map[span.URI]struct{}
+	gcOptimizationDetails   map[string]struct{}
 
-	// diagnosticsSema limits the concurrency of diagnostics runs, which can be expensive.
+	// diagnosticsSema limits the concurrency of diagnostics runs, which can be
+	// expensive.
 	diagnosticsSema chan struct{}
 
 	progress *progressTracker
+
+	// debouncer is used for debouncing diagnostics.
+	debouncer *debouncer
+
+	// When the workspace fails to load, we show its status through a progress
+	// report with an error message.
+	criticalErrorStatusMu sync.Mutex
+	criticalErrorStatus   *workDone
 }
 
-// sentDiagnostics is used to cache diagnostics that have been sent for a given file.
-type sentDiagnostics struct {
-	id           source.VersionedFileIdentity
-	sorted       []*source.Diagnostic
-	withAnalysis bool
-	snapshotID   uint64
+func (s *Server) workDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
+	return s.progress.cancel(ctx, params.Token)
 }
 
 func (s *Server) nonstandardRequest(ctx context.Context, method string, params interface{}) (interface{}, error) {
-	paramMap := params.(map[string]interface{})
-	if method == "gopls/diagnoseFiles" {
+	switch method {
+	case "gopls/diagnoseFiles":
+		paramMap := params.(map[string]interface{})
 		for _, file := range paramMap["files"].([]interface{}) {
 			snapshot, fh, ok, release, err := s.beginFileRequest(ctx, protocol.DocumentURI(file.(string)), source.UnknownKind)
 			defer release()
@@ -136,7 +148,7 @@ func (s *Server) nonstandardRequest(ctx context.Context, method string, params i
 }
 
 func notImplemented(method string) error {
-	return fmt.Errorf("%w: %q not yet implemented", jsonrpc2.ErrMethodNotFound, method)
+	return errors.Errorf("%w: %q not yet implemented", jsonrpc2.ErrMethodNotFound, method)
 }
 
 //go:generate helper/helper -d protocol/tsserver.go -o server_gen.go -u .

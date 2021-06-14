@@ -1,3 +1,7 @@
+// Copyright 2020 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package mod
 
 import (
@@ -12,13 +16,20 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 func Hover(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, position protocol.Position) (*protocol.Hover, error) {
-	uri := snapshot.View().ModFile()
+	var found bool
+	for _, uri := range snapshot.ModFiles() {
+		if fh.URI() == uri {
+			found = true
+			break
+		}
+	}
 
-	// For now, we only provide hover information for the view's go.mod file.
-	if uri == "" || fh.URI() != uri {
+	// We only provide hover information for the view's go.mod files.
+	if !found {
 		return nil, nil
 	}
 
@@ -28,15 +39,15 @@ func Hover(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, 
 	// Get the position of the cursor.
 	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
-		return nil, fmt.Errorf("getting modfile handle: %w", err)
+		return nil, errors.Errorf("getting modfile handle: %w", err)
 	}
 	spn, err := pm.Mapper.PointSpan(position)
 	if err != nil {
-		return nil, fmt.Errorf("computing cursor position: %w", err)
+		return nil, errors.Errorf("computing cursor position: %w", err)
 	}
 	hoverRng, err := spn.Range(pm.Mapper.Converter)
 	if err != nil {
-		return nil, fmt.Errorf("computing hover range: %w", err)
+		return nil, errors.Errorf("computing hover range: %w", err)
 	}
 
 	// Confirm that the cursor is at the position of a require statement.
@@ -64,7 +75,7 @@ func Hover(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, 
 	}
 
 	// Get the `go mod why` results for the given file.
-	why, err := snapshot.ModWhy(ctx)
+	why, err := snapshot.ModWhy(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +114,7 @@ func Hover(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, 
 	}, nil
 }
 
-func formatExplanation(text string, req *modfile.Require, options source.Options, isPrivate bool) string {
+func formatExplanation(text string, req *modfile.Require, options *source.Options, isPrivate bool) string {
 	text = strings.TrimSuffix(text, "\n")
 	splt := strings.Split(text, "\n")
 	length := len(splt)
@@ -133,7 +144,7 @@ func formatExplanation(text string, req *modfile.Require, options source.Options
 		if strings.ToLower(options.LinkTarget) == "pkg.go.dev" {
 			target = strings.Replace(target, req.Mod.Path, req.Mod.String(), 1)
 		}
-		reference = fmt.Sprintf("[%s](https://%s/%s)", imp, options.LinkTarget, target)
+		reference = fmt.Sprintf("[%s](%s)", imp, source.BuildLink(options.LinkTarget, target, ""))
 	}
 	b.WriteString("This module is necessary because " + reference + " is imported in")
 

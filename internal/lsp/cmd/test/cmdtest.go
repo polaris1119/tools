@@ -11,13 +11,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 
-	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/jsonrpc2/servertest"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/cmd"
@@ -31,74 +27,41 @@ import (
 )
 
 type runner struct {
-	exporter    packagestest.Exporter
 	data        *tests.Data
 	ctx         context.Context
 	options     func(*source.Options)
-	normalizers []normalizer
+	normalizers []tests.Normalizer
 	remote      string
 }
 
-type normalizer struct {
-	path     string
-	slashed  string
-	escaped  string
-	fragment string
-}
-
-func TestCommandLine(testdata string, options func(*source.Options)) func(*testing.T, packagestest.Exporter) {
-	return func(t *testing.T, exporter packagestest.Exporter) {
-		if stat, err := os.Stat(testdata); err != nil || !stat.IsDir() {
-			t.Skip("testdata directory not present")
-		}
+func TestCommandLine(t *testing.T, testdata string, options func(*source.Options)) {
+	// On Android, the testdata directory is not copied to the runner.
+	if stat, err := os.Stat(testdata); err != nil || !stat.IsDir() {
+		t.Skip("testdata directory not present")
+	}
+	tests.RunTests(t, testdata, false, func(t *testing.T, datum *tests.Data) {
 		ctx := tests.Context(t)
 		ts := NewTestServer(ctx, options)
-		data := tests.Load(t, exporter, testdata)
-		for _, datum := range data {
-			defer datum.Exported.Cleanup()
-			t.Run(tests.FormatFolderName(datum.Folder), func(t *testing.T) {
-				t.Helper()
-				tests.Run(t, NewRunner(exporter, datum, ctx, ts.Addr, options), datum)
-			})
-		}
+		tests.Run(t, NewRunner(datum, ctx, ts.Addr, options), datum)
 		cmd.CloseTestConnections(ctx)
-	}
+	})
 }
 
 func NewTestServer(ctx context.Context, options func(*source.Options)) *servertest.TCPServer {
 	ctx = debug.WithInstance(ctx, "", "")
-	cache := cache.New(ctx, options)
+	cache := cache.New(options)
 	ss := lsprpc.NewStreamServer(cache, false)
 	return servertest.NewTCPServer(ctx, ss, nil)
 }
 
-func NewRunner(exporter packagestest.Exporter, data *tests.Data, ctx context.Context, remote string, options func(*source.Options)) *runner {
-	r := &runner{
-		exporter:    exporter,
+func NewRunner(data *tests.Data, ctx context.Context, remote string, options func(*source.Options)) *runner {
+	return &runner{
 		data:        data,
 		ctx:         ctx,
 		options:     options,
-		normalizers: make([]normalizer, 0, len(data.Exported.Modules)),
+		normalizers: tests.CollectNormalizers(data.Exported),
 		remote:      remote,
 	}
-	// build the path normalizing patterns
-	for _, m := range data.Exported.Modules {
-		for fragment := range m.Files {
-			n := normalizer{
-				path:     data.Exported.File(m.Name, fragment),
-				fragment: fragment,
-			}
-			if n.slashed = filepath.ToSlash(n.path); n.slashed == n.path {
-				n.slashed = ""
-			}
-			quoted := strconv.Quote(n.path)
-			if n.escaped = quoted[1 : len(quoted)-1]; n.escaped == n.path {
-				n.escaped = ""
-			}
-			r.normalizers = append(r.normalizers, n)
-		}
-	}
-	return r
 }
 
 func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) {
@@ -135,6 +98,10 @@ func (r *runner) RankCompletion(t *testing.T, src span.Span, test tests.Completi
 
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {
 	//TODO: function extraction not supported on command line
+}
+
+func (r *runner) AddImport(t *testing.T, uri span.URI, expectedImport string) {
+	//TODO: import addition not supported on command line
 }
 
 func (r *runner) runGoplsCmd(t testing.TB, args ...string) (string, string) {
@@ -183,80 +150,10 @@ func (r *runner) NormalizeGoplsCmd(t testing.TB, args ...string) (string, string
 	return r.Normalize(stdout), r.Normalize(stderr)
 }
 
-// NormalizePrefix normalizes a single path at the front of the input string.
-func (r *runner) NormalizePrefix(s string) string {
-	for _, n := range r.normalizers {
-		if t := strings.TrimPrefix(s, n.path); t != s {
-			return n.fragment + t
-		}
-		if t := strings.TrimPrefix(s, n.slashed); t != s {
-			return n.fragment + t
-		}
-		if t := strings.TrimPrefix(s, n.escaped); t != s {
-			return n.fragment + t
-		}
-	}
-	return s
+func (r *runner) Normalize(s string) string {
+	return tests.Normalize(s, r.normalizers)
 }
 
-// Normalize replaces all paths present in s with just the fragment portion
-// this is used to make golden files not depend on the temporary paths of the files
-func (r *runner) Normalize(s string) string {
-	type entry struct {
-		path     string
-		index    int
-		fragment string
-	}
-	match := make([]entry, 0, len(r.normalizers))
-	// collect the initial state of all the matchers
-	for _, n := range r.normalizers {
-		index := strings.Index(s, n.path)
-		if index >= 0 {
-			match = append(match, entry{n.path, index, n.fragment})
-		}
-		if n.slashed != "" {
-			index := strings.Index(s, n.slashed)
-			if index >= 0 {
-				match = append(match, entry{n.slashed, index, n.fragment})
-			}
-		}
-		if n.escaped != "" {
-			index := strings.Index(s, n.escaped)
-			if index >= 0 {
-				match = append(match, entry{n.escaped, index, n.fragment})
-			}
-		}
-	}
-	// result should be the same or shorter than the input
-	buf := bytes.NewBuffer(make([]byte, 0, len(s)))
-	last := 0
-	for {
-		// find the nearest path match to the start of the buffer
-		next := -1
-		nearest := len(s)
-		for i, c := range match {
-			if c.index >= 0 && nearest > c.index {
-				nearest = c.index
-				next = i
-			}
-		}
-		// if there are no matches, we copy the rest of the string and are done
-		if next < 0 {
-			buf.WriteString(s[last:])
-			return buf.String()
-		}
-		// we have a match
-		n := &match[next]
-		// copy up to the start of the match
-		buf.WriteString(s[last:n.index])
-		// skip over the filename
-		last = n.index + len(n.path)
-		// add in the fragment instead
-		buf.WriteString(n.fragment)
-		// see what the next match for this path is
-		n.index = strings.Index(s[last:], n.path)
-		if n.index >= 0 {
-			n.index += last
-		}
-	}
+func (r *runner) NormalizePrefix(s string) string {
+	return tests.NormalizePrefix(s, r.normalizers)
 }

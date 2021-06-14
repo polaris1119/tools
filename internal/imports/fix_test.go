@@ -13,7 +13,6 @@ import (
 	"log"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1307,11 +1306,6 @@ func bar() {
 // Test support for packages in GOPATH that are actually symlinks.
 // Also test that a symlink loop does not block the process.
 func TestImportSymlinks(t *testing.T) {
-	switch runtime.GOOS {
-	case "windows", "plan9":
-		t.Skipf("skipping test on %q as there are no symlinks", runtime.GOOS)
-	}
-
 	const input = `package p
 
 var (
@@ -1347,11 +1341,6 @@ var (
 }
 
 func TestImportSymlinksWithIgnore(t *testing.T) {
-	switch runtime.GOOS {
-	case "windows", "plan9":
-		t.Skipf("skipping test on %q as there are no symlinks", runtime.GOOS)
-	}
-
 	const input = `package p
 
 var (
@@ -1568,8 +1557,8 @@ var _ = bytes.Buffer
 		},
 	}.test(t, func(t *goimportTest) {
 		// Run in GOROOT/src so that the std module shows up in go list -m all.
-		t.env.WorkingDir = filepath.Join(t.env.goroot(), "src")
-		got, err := t.processNonModule(filepath.Join(t.env.goroot(), "src/x.go"), []byte(input), nil)
+		t.env.WorkingDir = filepath.Join(t.goroot, "src")
+		got, err := t.processNonModule(filepath.Join(t.goroot, "src/x.go"), []byte(input), nil)
 		if err != nil {
 			t.Fatalf("Process() = %v", err)
 		}
@@ -1591,7 +1580,7 @@ var _ = ecdsa.GenerateKey
 			Files: fm{"x.go": "package x"},
 		},
 	}.test(t, func(t *goimportTest) {
-		got, err := t.processNonModule(filepath.Join(t.env.goroot(), "src/crypto/ecdsa/foo.go"), []byte(input), nil)
+		got, err := t.processNonModule(filepath.Join(t.goroot, "src/crypto/ecdsa/foo.go"), []byte(input), nil)
 		if err != nil {
 			t.Fatalf("Process() = %v", err)
 		}
@@ -1646,6 +1635,7 @@ func (c testConfig) test(t *testing.T, fn func(*goimportTest)) {
 			// packagestest clears out GOROOT to work around golang/go#32849,
 			// which isn't relevant here. Fill it back in so we can find the standard library.
 			it.env.Env["GOROOT"] = build.Default.GOROOT
+			it.goroot = build.Default.GOROOT
 
 			fn(it)
 		})
@@ -1662,6 +1652,7 @@ func (c testConfig) processTest(t *testing.T, module, file string, contents []by
 
 type goimportTest struct {
 	*testing.T
+	goroot   string
 	env      *ProcessEnv
 	exported *packagestest.Exported
 }
@@ -2558,11 +2549,11 @@ func TestX() {
 	}.processTest(t, "foo.com/a", "a_test.go", nil, nil, want)
 }
 
-// TestStdLibGetCandidates tests that get packages finds std library packages
+// TestGetCandidates tests that get packages finds packages
 // with correct priorities.
 func TestGetCandidates(t *testing.T) {
 	type res struct {
-		relevance  int
+		relevance  float64
 		name, path string
 	}
 	want := []res{
@@ -2611,14 +2602,64 @@ func TestGetCandidates(t *testing.T) {
 			got[i].relevance = 0
 		}
 		if !reflect.DeepEqual(want, got) {
-			t.Errorf("wanted stdlib results in order %v, got %v", want, got)
+			t.Errorf("wanted results in order %v, got %v", want, got)
+		}
+	})
+}
+
+func TestGetImportPaths(t *testing.T) {
+	type res struct {
+		relevance  float64
+		name, path string
+	}
+	want := []res{
+		{0, "http", "net/http"},
+		{0, "net", "net"},
+		{0, "neta", "neta.com/neta"},
+	}
+
+	testConfig{
+		modules: []packagestest.Module{
+			{
+				Name:  "neta.com",
+				Files: fm{"neta/neta.go": "package neta\n"},
+			},
+		},
+	}.test(t, func(t *goimportTest) {
+		var mu sync.Mutex
+		var got []res
+		add := func(c ImportFix) {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, w := range want {
+				if c.StmtInfo.ImportPath == w.path {
+					got = append(got, res{c.Relevance, c.IdentName, c.StmtInfo.ImportPath})
+				}
+			}
+		}
+		if err := GetImportPaths(context.Background(), add, "ne", "x.go", "x", t.env); err != nil {
+			t.Fatalf("GetImportPaths() = %v", err)
+		}
+		// Sort, then clear out relevance so it doesn't mess up the DeepEqual.
+		sort.Slice(got, func(i, j int) bool {
+			ri, rj := got[i], got[j]
+			if ri.relevance != rj.relevance {
+				return ri.relevance > rj.relevance // Highest first.
+			}
+			return ri.name < rj.name
+		})
+		for i := range got {
+			got[i].relevance = 0
+		}
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("wanted results in order %v, got %v", want, got)
 		}
 	})
 }
 
 func TestGetPackageCompletions(t *testing.T) {
 	type res struct {
-		relevance          int
+		relevance          float64
 		name, path, symbol string
 	}
 	want := []res{
@@ -2662,7 +2703,7 @@ func TestGetPackageCompletions(t *testing.T) {
 			got[i].relevance = 0
 		}
 		if !reflect.DeepEqual(want, got) {
-			t.Errorf("wanted stdlib results in order %v, got %v", want, got)
+			t.Errorf("wanted results in order %v, got %v", want, got)
 		}
 	})
 }

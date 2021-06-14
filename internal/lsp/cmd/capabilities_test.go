@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package cmd
 
 import (
@@ -24,7 +28,7 @@ func TestCapabilities(t *testing.T) {
 	if err := ioutil.WriteFile(tmpFile, []byte(""), 0775); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(`module fake`), 0775); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module fake\n\ngo 1.12\n"), 0775); err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpDir)
@@ -39,7 +43,7 @@ func TestCapabilities(t *testing.T) {
 	params.Capabilities.Workspace.Configuration = true
 
 	// Send an initialize request to the server.
-	c.Server = lsp.NewServer(cache.New(ctx, app.options).NewSession(ctx), c.Client)
+	c.Server = lsp.NewServer(cache.New(app.options).NewSession(ctx), c.Client)
 	result, err := c.Server.Initialize(ctx, params)
 	if err != nil {
 		t.Fatal(err)
@@ -102,11 +106,8 @@ func TestCapabilities(t *testing.T) {
 	}
 
 	if err := c.Server.DidSave(ctx, &protocol.DidSaveTextDocumentParams{
-		TextDocument: protocol.VersionedTextDocumentIdentifier{
-			Version: 2,
-			TextDocumentIdentifier: protocol.TextDocumentIdentifier{
-				URI: uri,
-			},
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: uri,
 		},
 		// LSP specifies that a file can be saved with optional text, so this field must be nil.
 		Text: nil,

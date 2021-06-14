@@ -8,147 +8,109 @@ package mod
 
 import (
 	"context"
-	"regexp"
-	"strings"
-	"unicode"
+	"fmt"
 
-	"golang.org/x/mod/modfile"
-	"golang.org/x/mod/module"
 	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/lsp/command"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
-	"golang.org/x/tools/internal/span"
 )
 
 func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.VersionedFileIdentity][]*source.Diagnostic, error) {
-	uri := snapshot.View().ModFile()
-	if uri == "" {
-		return nil, nil
-	}
-
-	ctx, done := event.Start(ctx, "mod.Diagnostics", tag.URI.Of(uri))
+	ctx, done := event.Start(ctx, "mod.Diagnostics", tag.Snapshot.Of(snapshot.ID()))
 	defer done()
 
-	fh, err := snapshot.GetFile(ctx, uri)
-	if err != nil {
-		return nil, err
-	}
-	tidied, err := snapshot.ModTidy(ctx)
-	if err == source.ErrTmpModfileUnsupported {
-		return nil, nil
-	}
-	reports := map[source.VersionedFileIdentity][]*source.Diagnostic{
-		fh.VersionedFileIdentity(): {},
-	}
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range tidied.Errors {
-		diag := &source.Diagnostic{
-			Message: e.Message,
-			Range:   e.Range,
-			Source:  e.Category,
-		}
-		if e.Category == "syntax" {
-			diag.Severity = protocol.SeverityError
-		} else {
-			diag.Severity = protocol.SeverityWarning
-		}
-		fh, err := snapshot.GetFile(ctx, e.URI)
+	reports := map[source.VersionedFileIdentity][]*source.Diagnostic{}
+	for _, uri := range snapshot.ModFiles() {
+		fh, err := snapshot.GetVersionedFile(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
-		reports[fh.VersionedFileIdentity()] = append(reports[fh.VersionedFileIdentity()], diag)
+		reports[fh.VersionedFileIdentity()] = []*source.Diagnostic{}
+		diagnostics, err := DiagnosticsForMod(ctx, snapshot, fh)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range diagnostics {
+			fh, err := snapshot.GetVersionedFile(ctx, d.URI)
+			if err != nil {
+				return nil, err
+			}
+			reports[fh.VersionedFileIdentity()] = append(reports[fh.VersionedFileIdentity()], d)
+		}
 	}
 	return reports, nil
 }
 
-var moduleAtVersionRe = regexp.MustCompile(`^(?P<module>.*)@(?P<version>.*)$`)
-
-// ExtractGoCommandError tries to parse errors that come from the go command
-// and shape them into go.mod diagnostics.
-func ExtractGoCommandError(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, loadErr error) (*source.Diagnostic, error) {
-	// We try to match module versions in error messages. Some examples:
-	//
-	//  example.com@v1.2.2: reading example.com/@v/v1.2.2.mod: no such file or directory
-	//  go: github.com/cockroachdb/apd/v2@v2.0.72: reading github.com/cockroachdb/apd/go.mod at revision v2.0.72: unknown revision v2.0.72
-	//  go: example.com@v1.2.3 requires\n\trandom.org@v1.2.3: parsing go.mod:\n\tmodule declares its path as: bob.org\n\tbut was required as: random.org
-	//
-	// We split on colons and whitespace, and attempt to match on something
-	// that matches module@version. If we're able to find a match, we try to
-	// find anything that matches it in the go.mod file.
-	var v module.Version
-	fields := strings.FieldsFunc(loadErr.Error(), func(r rune) bool {
-		return unicode.IsSpace(r) || r == ':'
-	})
-	for _, s := range fields {
-		s = strings.TrimSpace(s)
-		match := moduleAtVersionRe.FindStringSubmatch(s)
-		if match == nil || len(match) < 3 {
-			continue
-		}
-		v.Path = match[1]
-		v.Version = match[2]
-		if err := module.Check(v.Path, v.Version); err == nil {
-			break
-		}
-	}
+func DiagnosticsForMod(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]*source.Diagnostic, error) {
 	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
-		return nil, err
+		if pm == nil || len(pm.ParseErrors) == 0 {
+			return nil, err
+		}
+		return pm.ParseErrors, nil
 	}
-	toDiagnostic := func(line *modfile.Line) (*source.Diagnostic, error) {
-		rng, err := rangeFromPositions(fh.URI(), pm.Mapper, line.Start, line.End)
+
+	var diagnostics []*source.Diagnostic
+
+	// Add upgrade quick fixes for individual modules if we know about them.
+	upgrades := snapshot.View().ModuleUpgrades()
+	for _, req := range pm.File.Require {
+		ver, ok := upgrades[req.Mod.Path]
+		if !ok || req.Mod.Version == ver {
+			continue
+		}
+		rng, err := lineToRange(pm.Mapper, fh.URI(), req.Syntax.Start, req.Syntax.End)
 		if err != nil {
 			return nil, err
 		}
-		return &source.Diagnostic{
-			Message:  loadErr.Error(),
-			Range:    rng,
-			Severity: protocol.SeverityError,
-		}, nil
-	}
-	// Check if there are any require, exclude, or replace statements that
-	// match this module version.
-	for _, req := range pm.File.Require {
-		if req.Mod != v {
-			continue
-		}
-		return toDiagnostic(req.Syntax)
-	}
-	for _, ex := range pm.File.Exclude {
-		if ex.Mod != v {
-			continue
-		}
-		return toDiagnostic(ex.Syntax)
-	}
-	for _, rep := range pm.File.Replace {
-		if rep.New != v && rep.Old != v {
-			continue
-		}
-		return toDiagnostic(rep.Syntax)
-	}
-	// No match for the module path was found in the go.mod file.
-	// Show the error on the module declaration.
-	return toDiagnostic(pm.File.Module.Syntax)
-}
-
-func rangeFromPositions(uri span.URI, m *protocol.ColumnMapper, s, e modfile.Position) (protocol.Range, error) {
-	toPoint := func(offset int) (span.Point, error) {
-		l, c, err := m.Converter.ToPosition(offset)
+		// Upgrade to the exact version we offer the user, not the most recent.
+		title := fmt.Sprintf("Upgrade to %v", ver)
+		cmd, err := command.NewUpgradeDependencyCommand(title, command.DependencyArgs{
+			URI:        protocol.URIFromSpanURI(fh.URI()),
+			AddRequire: false,
+			GoCmdArgs:  []string{req.Mod.Path + "@" + ver},
+		})
 		if err != nil {
-			return span.Point{}, err
+			return nil, err
 		}
-		return span.NewPoint(l, c, offset), nil
+		diagnostics = append(diagnostics, &source.Diagnostic{
+			URI:            fh.URI(),
+			Range:          rng,
+			Severity:       protocol.SeverityInformation,
+			Source:         source.UpgradeNotification,
+			Message:        fmt.Sprintf("%v can be upgraded", req.Mod.Path),
+			SuggestedFixes: []source.SuggestedFix{source.SuggestedFixFromCommand(cmd, protocol.QuickFix)},
+		})
 	}
-	start, err := toPoint(s.Byte)
-	if err != nil {
-		return protocol.Range{}, err
+
+	// Packages in the workspace can contribute diagnostics to go.mod files.
+	wspkgs, err := snapshot.WorkspacePackages(ctx)
+	if err != nil && !source.IsNonFatalGoModError(err) {
+		event.Error(ctx, "diagnosing go.mod", err)
 	}
-	end, err := toPoint(e.Byte)
-	if err != nil {
-		return protocol.Range{}, err
+	if err == nil {
+		for _, pkg := range wspkgs {
+			pkgDiagnostics, err := snapshot.DiagnosePackage(ctx, pkg)
+			if err != nil {
+				return nil, err
+			}
+			diagnostics = append(diagnostics, pkgDiagnostics[fh.URI()]...)
+		}
 	}
-	return m.Range(span.New(uri, start, end))
+
+	tidied, err := snapshot.ModTidy(ctx, pm)
+	if err != nil && !source.IsNonFatalGoModError(err) {
+		event.Error(ctx, "diagnosing go.mod", err)
+	}
+	if err == nil {
+		for _, d := range tidied.Diagnostics {
+			if d.URI != fh.URI() {
+				continue
+			}
+			diagnostics = append(diagnostics, d)
+		}
+	}
+	return diagnostics, nil
 }

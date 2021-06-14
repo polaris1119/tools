@@ -7,60 +7,75 @@ package lsp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/lsp/debug"
-	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	errors "golang.org/x/xerrors"
 )
 
 func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitialize) (*protocol.InitializeResult, error) {
 	s.stateMu.Lock()
 	if s.state >= serverInitializing {
 		defer s.stateMu.Unlock()
-		return nil, fmt.Errorf("%w: initialize called while server in %v state", jsonrpc2.ErrInvalidRequest, s.state)
+		return nil, errors.Errorf("%w: initialize called while server in %v state", jsonrpc2.ErrInvalidRequest, s.state)
 	}
 	s.state = serverInitializing
 	s.stateMu.Unlock()
 
+	// For uniqueness, use the gopls PID rather than params.ProcessID (the client
+	// pid). Some clients might start multiple gopls servers, though they
+	// probably shouldn't.
+	pid := os.Getpid()
+	s.tempDir = filepath.Join(os.TempDir(), fmt.Sprintf("gopls-%d.%s", pid, s.session.ID()))
+	err := os.Mkdir(s.tempDir, 0700)
+	if err != nil {
+		// MkdirTemp could fail due to permissions issues. This is a problem with
+		// the user's environment, but should not block gopls otherwise behaving.
+		// All usage of s.tempDir should be predicated on having a non-empty
+		// s.tempDir.
+		event.Error(ctx, "creating temp dir", err)
+		s.tempDir = ""
+	}
 	s.progress.supportsWorkDoneProgress = params.Capabilities.Window.WorkDoneProgress
 
 	options := s.session.Options()
 	defer func() { s.session.SetOptions(options) }()
 
-	if err := s.handleOptionResults(ctx, source.SetOptions(&options, params.InitializationOptions)); err != nil {
+	if err := s.handleOptionResults(ctx, source.SetOptions(options, params.InitializationOptions)); err != nil {
 		return nil, err
 	}
 	options.ForClientCapabilities(params.Capabilities)
 
-	// gopls only supports URIs with a file:// scheme. Any other URIs will not
-	// work, so fail to initialize. See golang/go#40272.
-	if params.RootURI != "" && !params.RootURI.SpanURI().IsFile() {
-		return nil, fmt.Errorf("unsupported URI scheme: %v (gopls only supports file URIs)", params.RootURI)
-	}
-	for _, folder := range params.WorkspaceFolders {
-		uri := span.URIFromURI(folder.URI)
-		if !uri.IsFile() {
-			return nil, fmt.Errorf("unsupported URI scheme: %q (gopls only supports file URIs)", folder.URI)
-		}
-	}
-
-	s.pendingFolders = params.WorkspaceFolders
-	if len(s.pendingFolders) == 0 {
+	folders := params.WorkspaceFolders
+	if len(folders) == 0 {
 		if params.RootURI != "" {
-			s.pendingFolders = []protocol.WorkspaceFolder{{
+			folders = []protocol.WorkspaceFolder{{
 				URI:  string(params.RootURI),
 				Name: path.Base(params.RootURI.SpanURI().Filename()),
 			}}
 		}
+	}
+	for _, folder := range folders {
+		uri := span.URIFromURI(folder.URI)
+		if !uri.IsFile() {
+			continue
+		}
+		s.pendingFolders = append(s.pendingFolders, folder)
+	}
+	// gopls only supports URIs with a file:// scheme, so if we have no
+	// workspace folders with a supported scheme, fail to initialize.
+	if len(folders) > 0 && len(s.pendingFolders) == 0 {
+		return nil, fmt.Errorf("unsupported URI schemes: %v (gopls only supports file URIs)", folders)
 	}
 
 	var codeActionProvider interface{} = true
@@ -80,8 +95,27 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 		}
 	}
 
-	goplsVer := &bytes.Buffer{}
-	debug.PrintVersionInfo(ctx, goplsVer, true, debug.PlainText)
+	versionInfo := debug.VersionInfo()
+
+	// golang/go#45732: Warn users who've installed sergi/go-diff@v1.2.0, since
+	// it will corrupt the formatting of their files.
+	for _, dep := range versionInfo.Deps {
+		if dep.Path == "github.com/sergi/go-diff" && dep.Version == "v1.2.0" {
+			if err := s.eventuallyShowMessage(ctx, &protocol.ShowMessageParams{
+				Message: `It looks like you have a bad gopls installation.
+Please reinstall gopls by running 'GO111MODULE=on go get golang.org/x/tools/gopls@latest'.
+See https://github.com/golang/go/issues/45732 for more information.`,
+				Type: protocol.Error,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	goplsVersion, err := json.Marshal(versionInfo)
+	if err != nil {
+		return nil, err
+	}
 
 	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
@@ -115,8 +149,8 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 					IncludeText: false,
 				},
 			},
-			Workspace: protocol.WorkspaceGn{
-				WorkspaceFolders: protocol.WorkspaceFoldersGn{
+			Workspace: protocol.Workspace5Gn{
+				WorkspaceFolders: protocol.WorkspaceFolders4Gn{
 					Supported:           true,
 					ChangeNotifications: "workspace/didChangeWorkspaceFolders",
 				},
@@ -127,7 +161,7 @@ func (s *Server) initialize(ctx context.Context, params *protocol.ParamInitializ
 			Version string `json:"version,omitempty"`
 		}{
 			Name:    "gopls",
-			Version: goplsVer.String(),
+			Version: string(goplsVersion),
 		},
 	}, nil
 }
@@ -136,40 +170,38 @@ func (s *Server) initialized(ctx context.Context, params *protocol.InitializedPa
 	s.stateMu.Lock()
 	if s.state >= serverInitialized {
 		defer s.stateMu.Unlock()
-		return fmt.Errorf("%w: initalized called while server in %v state", jsonrpc2.ErrInvalidRequest, s.state)
+		return errors.Errorf("%w: initialized called while server in %v state", jsonrpc2.ErrInvalidRequest, s.state)
 	}
 	s.state = serverInitialized
 	s.stateMu.Unlock()
 
+	for _, not := range s.notifications {
+		s.client.ShowMessage(ctx, not)
+	}
+	s.notifications = nil
+
 	options := s.session.Options()
 	defer func() { s.session.SetOptions(options) }()
-
-	var registrations []protocol.Registration
-	if options.ConfigurationSupported && options.DynamicConfigurationSupported {
-		registrations = append(registrations,
-			protocol.Registration{
-				ID:     "workspace/didChangeConfiguration",
-				Method: "workspace/didChangeConfiguration",
-			},
-			protocol.Registration{
-				ID:     "workspace/didChangeWorkspaceFolders",
-				Method: "workspace/didChangeWorkspaceFolders",
-			},
-		)
-	}
-
-	// TODO: this event logging may be unnecessary.
-	// The version info is included in the initialize response.
-	buf := &bytes.Buffer{}
-	debug.PrintVersionInfo(ctx, buf, true, debug.PlainText)
-	event.Log(ctx, buf.String())
 
 	if err := s.addFolders(ctx, s.pendingFolders); err != nil {
 		return err
 	}
 	s.pendingFolders = nil
 
-	if len(registrations) > 0 {
+	if options.ConfigurationSupported && options.DynamicConfigurationSupported {
+		registrations := []protocol.Registration{
+			{
+				ID:     "workspace/didChangeConfiguration",
+				Method: "workspace/didChangeConfiguration",
+			},
+			{
+				ID:     "workspace/didChangeWorkspaceFolders",
+				Method: "workspace/didChangeWorkspaceFolders",
+			},
+		}
+		if options.SemanticTokens {
+			registrations = append(registrations, semanticTokenRegistration(options.SemanticTypes, options.SemanticMods))
+		}
 		if err := s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
 			Registrations: registrations,
 		}); err != nil {
@@ -189,26 +221,39 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		defer func() {
 			go func() {
 				wg.Wait()
-				work.end(ctx, "Done.")
+				work.end("Done.")
 			}()
 		}()
 	}
-	dirsToWatch := map[span.URI]struct{}{}
+	// Only one view gets to have a workspace.
+	var allFoldersWg sync.WaitGroup
 	for _, folder := range folders {
 		uri := span.URIFromURI(folder.URI)
-		view, snapshot, release, err := s.addView(ctx, folder.Name, uri)
-		if err != nil {
-			viewErrors[uri] = err
+		// Ignore non-file URIs.
+		if !uri.IsFile() {
 			continue
 		}
-		for _, dir := range snapshot.WorkspaceDirectories(ctx) {
-			dirsToWatch[dir] = struct{}{}
+		work := s.progress.start(ctx, "Setting up workspace", "Loading packages...", nil, nil)
+		snapshot, release, err := s.addView(ctx, folder.Name, uri)
+		if err != nil {
+			viewErrors[uri] = err
+			work.end(fmt.Sprintf("Error loading packages: %s", err))
+			continue
 		}
+		var swg sync.WaitGroup
+		swg.Add(1)
+		allFoldersWg.Add(1)
+		go func() {
+			defer swg.Done()
+			defer allFoldersWg.Done()
+			snapshot.AwaitInitialized(ctx)
+			work.end("Finished loading packages.")
+		}()
 
 		// Print each view's environment.
 		buf := &bytes.Buffer{}
-		if err := view.WriteEnv(ctx, buf); err != nil {
-			event.Error(ctx, "failed to write environment", err, tag.Directory.Of(view.Folder().Filename()))
+		if err := snapshot.WriteEnv(ctx, buf); err != nil {
+			viewErrors[uri] = err
 			continue
 		}
 		event.Log(ctx, buf.String())
@@ -217,17 +262,20 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		wg.Add(1)
 		go func() {
 			s.diagnoseDetached(snapshot)
+			swg.Wait()
 			release()
 			wg.Done()
 		}()
 	}
+
 	// Register for file watching notifications, if they are supported.
-	s.watchedDirectoriesMu.Lock()
-	err := s.registerWatchedDirectoriesLocked(ctx, dirsToWatch)
-	s.watchedDirectoriesMu.Unlock()
-	if err != nil {
-		return err
+	// Wait for all snapshots to be initialized first, since all files might
+	// not yet be known to the snapshots.
+	allFoldersWg.Wait()
+	if err := s.updateWatchedDirectories(ctx); err != nil {
+		event.Error(ctx, "failed to register for file watching notifications", err)
 	}
+
 	if len(viewErrors) > 0 {
 		errMsg := fmt.Sprintf("Error loading workspace folders (expected %v, got %v)\n", len(folders), len(s.session.Views())-originalViews)
 		for uri, err := range viewErrors {
@@ -245,34 +293,14 @@ func (s *Server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 // with the previously registered set of directories. If the set of directories
 // has changed, we unregister and re-register for file watching notifications.
 // updatedSnapshots is the set of snapshots that have been updated.
-func (s *Server) updateWatchedDirectories(ctx context.Context, updatedSnapshots []source.Snapshot) error {
-	dirsToWatch := map[span.URI]struct{}{}
-	seenViews := map[source.View]struct{}{}
+func (s *Server) updateWatchedDirectories(ctx context.Context) error {
+	patterns := s.session.FileWatchingGlobPatterns(ctx)
 
-	// Collect all of the workspace directories from the updated snapshots.
-	for _, snapshot := range updatedSnapshots {
-		seenViews[snapshot.View()] = struct{}{}
-		for _, dir := range snapshot.WorkspaceDirectories(ctx) {
-			dirsToWatch[dir] = struct{}{}
-		}
-	}
-	// Not all views were necessarily updated, so check the remaining views.
-	for _, view := range s.session.Views() {
-		if _, ok := seenViews[view]; ok {
-			continue
-		}
-		snapshot, release := view.Snapshot(ctx)
-		for _, dir := range snapshot.WorkspaceDirectories(ctx) {
-			dirsToWatch[dir] = struct{}{}
-		}
-		release()
-	}
-
-	s.watchedDirectoriesMu.Lock()
-	defer s.watchedDirectoriesMu.Unlock()
+	s.watchedGlobPatternsMu.Lock()
+	defer s.watchedGlobPatternsMu.Unlock()
 
 	// Nothing to do if the set of workspace directories is unchanged.
-	if equalURISet(s.watchedDirectories, dirsToWatch) {
+	if equalURISet(s.watchedGlobPatterns, patterns) {
 		return nil
 	}
 
@@ -281,11 +309,11 @@ func (s *Server) updateWatchedDirectories(ctx context.Context, updatedSnapshots 
 	// period where no files are being watched. Still, if a user makes on-disk
 	// changes before these updates are complete, we may miss them for the new
 	// directories.
-	if s.watchRegistrationCount > 0 {
-		prevID := s.watchRegistrationCount - 1
-		if err := s.registerWatchedDirectoriesLocked(ctx, dirsToWatch); err != nil {
-			return err
-		}
+	prevID := s.watchRegistrationCount - 1
+	if err := s.registerWatchedDirectoriesLocked(ctx, patterns); err != nil {
+		return err
+	}
+	if prevID >= 0 {
 		return s.client.UnregisterCapability(ctx, &protocol.UnregistrationParams{
 			Unregisterations: []protocol.Unregistration{{
 				ID:     watchedFilesCapabilityID(prevID),
@@ -296,11 +324,11 @@ func (s *Server) updateWatchedDirectories(ctx context.Context, updatedSnapshots 
 	return nil
 }
 
-func watchedFilesCapabilityID(id uint64) string {
+func watchedFilesCapabilityID(id int) string {
 	return fmt.Sprintf("workspace/didChangeWatchedFiles-%d", id)
 }
 
-func equalURISet(m1, m2 map[span.URI]struct{}) bool {
+func equalURISet(m1, m2 map[string]struct{}) bool {
 	if len(m1) != len(m2) {
 		return false
 	}
@@ -315,20 +343,21 @@ func equalURISet(m1, m2 map[span.URI]struct{}) bool {
 
 // registerWatchedDirectoriesLocked sends the workspace/didChangeWatchedFiles
 // registrations to the client and updates s.watchedDirectories.
-func (s *Server) registerWatchedDirectoriesLocked(ctx context.Context, dirs map[span.URI]struct{}) error {
+func (s *Server) registerWatchedDirectoriesLocked(ctx context.Context, patterns map[string]struct{}) error {
 	if !s.session.Options().DynamicWatchedFilesSupported {
 		return nil
 	}
-	for k := range s.watchedDirectories {
-		delete(s.watchedDirectories, k)
+	for k := range s.watchedGlobPatterns {
+		delete(s.watchedGlobPatterns, k)
 	}
 	var watchers []protocol.FileSystemWatcher
-	for dir := range dirs {
+	for pattern := range patterns {
 		watchers = append(watchers, protocol.FileSystemWatcher{
-			GlobPattern: fmt.Sprintf("%s/**/*.{go,mod,sum}", dir),
-			Kind:        float64(protocol.WatchChange + protocol.WatchDelete + protocol.WatchCreate),
+			GlobPattern: pattern,
+			Kind:        uint32(protocol.WatchChange + protocol.WatchDelete + protocol.WatchCreate),
 		})
 	}
+
 	if err := s.client.RegisterCapability(ctx, &protocol.RegistrationParams{
 		Registrations: []protocol.Registration{{
 			ID:     watchedFilesCapabilityID(s.watchRegistrationCount),
@@ -342,8 +371,8 @@ func (s *Server) registerWatchedDirectoriesLocked(ctx context.Context, dirs map[
 	}
 	s.watchRegistrationCount++
 
-	for dir := range dirs {
-		s.watchedDirectories[dir] = struct{}{}
+	for k, v := range patterns {
+		s.watchedGlobPatterns[k] = v
 	}
 	return nil
 }
@@ -352,18 +381,14 @@ func (s *Server) fetchConfig(ctx context.Context, name string, folder span.URI, 
 	if !s.session.Options().ConfigurationSupported {
 		return nil
 	}
-	v := protocol.ParamConfiguration{
+	configs, err := s.client.Configuration(ctx, &protocol.ParamConfiguration{
 		ConfigurationParams: protocol.ConfigurationParams{
 			Items: []protocol.ConfigurationItem{{
 				ScopeURI: string(folder),
 				Section:  "gopls",
-			}, {
-				ScopeURI: string(folder),
-				Section:  fmt.Sprintf("gopls-%s", name),
 			}},
 		},
-	}
-	configs, err := s.client.Configuration(ctx, &v)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get workspace configuration from client (%s): %v", folder, err)
 	}
@@ -375,30 +400,42 @@ func (s *Server) fetchConfig(ctx context.Context, name string, folder span.URI, 
 	return nil
 }
 
+func (s *Server) eventuallyShowMessage(ctx context.Context, msg *protocol.ShowMessageParams) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state == serverInitialized {
+		return s.client.ShowMessage(ctx, msg)
+	}
+	s.notifications = append(s.notifications, msg)
+	return nil
+}
+
 func (s *Server) handleOptionResults(ctx context.Context, results source.OptionResults) error {
 	for _, result := range results {
 		if result.Error != nil {
-			if err := s.client.ShowMessage(ctx, &protocol.ShowMessageParams{
+			msg := &protocol.ShowMessageParams{
 				Type:    protocol.Error,
 				Message: result.Error.Error(),
-			}); err != nil {
+			}
+			if err := s.eventuallyShowMessage(ctx, msg); err != nil {
 				return err
 			}
 		}
 		switch result.State {
 		case source.OptionUnexpected:
-			if err := s.client.ShowMessage(ctx, &protocol.ShowMessageParams{
+			msg := &protocol.ShowMessageParams{
 				Type:    protocol.Error,
-				Message: fmt.Sprintf("unexpected config %s", result.Name),
-			}); err != nil {
+				Message: fmt.Sprintf("unexpected gopls setting %q", result.Name),
+			}
+			if err := s.eventuallyShowMessage(ctx, msg); err != nil {
 				return err
 			}
 		case source.OptionDeprecated:
-			msg := fmt.Sprintf("config %s is deprecated", result.Name)
+			msg := fmt.Sprintf("gopls setting %q is deprecated", result.Name)
 			if result.Replacement != "" {
-				msg = fmt.Sprintf("%s, use %s instead", msg, result.Replacement)
+				msg = fmt.Sprintf("%s, use %q instead", msg, result.Replacement)
 			}
-			if err := s.client.ShowMessage(ctx, &protocol.ShowMessageParams{
+			if err := s.eventuallyShowMessage(ctx, &protocol.ShowMessageParams{
 				Type:    protocol.Warning,
 				Message: msg,
 			}); err != nil {
@@ -424,7 +461,7 @@ func (s *Server) beginFileRequest(ctx context.Context, pURI protocol.DocumentURI
 		return nil, nil, false, func() {}, err
 	}
 	snapshot, release := view.Snapshot(ctx)
-	fh, err := snapshot.GetFile(ctx, uri)
+	fh, err := snapshot.GetVersionedFile(ctx, uri)
 	if err != nil {
 		release()
 		return nil, nil, false, func() {}, err
@@ -447,6 +484,11 @@ func (s *Server) shutdown(ctx context.Context) error {
 		// drop all the active views
 		s.session.Shutdown(ctx)
 		s.state = serverShutDown
+		if s.tempDir != "" {
+			if err := os.RemoveAll(s.tempDir); err != nil {
+				event.Error(ctx, "removing temp dir", err)
+			}
+		}
 	}
 	return nil
 }
@@ -455,8 +497,7 @@ func (s *Server) exit(ctx context.Context) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
-	// TODO: We need a better way to find the conn close method.
-	s.client.(io.Closer).Close()
+	s.client.Close()
 
 	if s.state != serverShutDown {
 		// TODO: We should be able to do better than this.

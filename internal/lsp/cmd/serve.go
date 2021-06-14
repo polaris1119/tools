@@ -8,9 +8,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/tools/internal/fakenet"
@@ -20,6 +20,7 @@ import (
 	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/tool"
+	errors "golang.org/x/xerrors"
 )
 
 // Serve is a struct that exposes the configurable parts of the LSP server as
@@ -71,25 +72,24 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 		}
 		defer closeLog()
 		di.ServerAddress = s.Address
-		di.DebugAddress = s.Debug
-		di.Serve(ctx)
 		di.MonitorMemory(ctx)
+		di.Serve(ctx, s.Debug)
 	}
 	var ss jsonrpc2.StreamServer
 	if s.app.Remote != "" {
-		network, addr := parseAddr(s.app.Remote)
+		network, addr := lsprpc.ParseAddr(s.app.Remote)
 		ss = lsprpc.NewForwarder(network, addr,
 			lsprpc.RemoteDebugAddress(s.RemoteDebug),
 			lsprpc.RemoteListenTimeout(s.RemoteListenTimeout),
 			lsprpc.RemoteLogfile(s.RemoteLogfile),
 		)
 	} else {
-		ss = lsprpc.NewStreamServer(cache.New(ctx, s.app.options), isDaemon)
+		ss = lsprpc.NewStreamServer(cache.New(s.app.options), isDaemon)
 	}
 
 	var network, addr string
 	if s.Address != "" {
-		network, addr = parseAddr(s.Address)
+		network, addr = lsprpc.ParseAddr(s.Address)
 	}
 	if s.Port != 0 {
 		network = "tcp"
@@ -105,18 +105,9 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 		stream = protocol.LoggingStream(stream, di.LogWriter)
 	}
 	conn := jsonrpc2.NewConn(stream)
-	return ss.ServeStream(ctx, conn)
-}
-
-// parseAddr parses the -listen flag in to a network, and address.
-func parseAddr(listen string) (network string, address string) {
-	// Allow passing just -remote=auto, as a shorthand for using automatic remote
-	// resolution.
-	if listen == lsprpc.AutoNetwork {
-		return lsprpc.AutoNetwork, ""
+	err := ss.ServeStream(ctx, conn)
+	if errors.Is(err, io.EOF) {
+		return nil
 	}
-	if parts := strings.SplitN(listen, ";", 2); len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return "tcp", listen
+	return err
 }

@@ -14,7 +14,6 @@ import (
 	"go/token"
 	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +23,7 @@ import (
 	"golang.org/x/tools/internal/lsp"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/debug"
+	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
@@ -170,6 +170,8 @@ func (app *Application) mainCommands() []tool.Application {
 		&app.Serve,
 		&version{app: app},
 		&bug{},
+		&apiJSON{},
+		&licenses{app: app},
 	}
 }
 
@@ -183,14 +185,17 @@ func (app *Application) featureCommands() []tool.Application {
 		&highlight{app: app},
 		&implementation{app: app},
 		&imports{app: app},
-		&inspect{app: app},
+		newRemote(app, ""),
+		newRemote(app, "inspect"),
 		&links{app: app},
 		&prepareRename{app: app},
 		&references{app: app},
 		&rename{app: app},
+		&semtok{app: app},
 		&signature{app: app},
 		&suggestedFix{app: app},
 		&symbols{app: app},
+		newWorkspace(app),
 		&workspaceSymbol{app: app},
 	}
 }
@@ -204,17 +209,17 @@ func (app *Application) connect(ctx context.Context) (*connection, error) {
 	switch {
 	case app.Remote == "":
 		connection := newConnection(app)
-		connection.Server = lsp.NewServer(cache.New(ctx, app.options).NewSession(ctx), connection.Client)
+		connection.Server = lsp.NewServer(cache.New(app.options).NewSession(ctx), connection.Client)
 		ctx = protocol.WithClient(ctx, connection.Client)
 		return connection, connection.initialize(ctx, app.options)
 	case strings.HasPrefix(app.Remote, "internal@"):
 		internalMu.Lock()
 		defer internalMu.Unlock()
-		opts := source.DefaultOptions()
+		opts := source.DefaultOptions().Clone()
 		if app.options != nil {
-			app.options(&opts)
+			app.options(opts)
 		}
-		key := fmt.Sprintf("%s %v", app.wd, opts)
+		key := fmt.Sprintf("%s %v %v %v", app.wd, opts.PreferredContentFormat, opts.HierarchicalDocumentSymbolSupport, opts.SymbolMatcher)
 		if c := internalConnections[key]; c != nil {
 			return c, nil
 		}
@@ -242,7 +247,7 @@ func CloseTestConnections(ctx context.Context) {
 
 func (app *Application) connectRemote(ctx context.Context, remote string) (*connection, error) {
 	connection := newConnection(app)
-	conn, err := net.Dial("tcp", remote)
+	conn, err := lsprpc.ConnectToRemote(ctx, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +265,7 @@ func (app *Application) connectRemote(ctx context.Context, remote string) (*conn
 var matcherString = map[source.SymbolMatcher]string{
 	source.SymbolFuzzy:           "fuzzy",
 	source.SymbolCaseSensitive:   "caseSensitive",
-	source.SymbolCaseInsensitive: "default",
+	source.SymbolCaseInsensitive: "caseInsensitive",
 }
 
 func (c *connection) initialize(ctx context.Context, options func(*source.Options)) error {
@@ -269,14 +274,21 @@ func (c *connection) initialize(ctx context.Context, options func(*source.Option
 	params.Capabilities.Workspace.Configuration = true
 
 	// Make sure to respect configured options when sending initialize request.
-	opts := source.DefaultOptions()
+	opts := source.DefaultOptions().Clone()
 	if options != nil {
-		options(&opts)
+		options(opts)
 	}
+	// If you add an additional option here, you must update the map key in connect.
 	params.Capabilities.TextDocument.Hover = protocol.HoverClientCapabilities{
 		ContentFormat: []protocol.MarkupKind{opts.PreferredContentFormat},
 	}
 	params.Capabilities.TextDocument.DocumentSymbol.HierarchicalDocumentSymbolSupport = opts.HierarchicalDocumentSymbolSupport
+	params.Capabilities.TextDocument.SemanticTokens = protocol.SemanticTokensClientCapabilities{}
+	params.Capabilities.TextDocument.SemanticTokens.Formats = []string{"relative"}
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Range = true
+	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = true
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = lsp.SemanticTypes()
+	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = lsp.SemanticModifiers()
 	params.InitializationOptions = map[string]interface{}{
 		"symbolMatcher": matcherString[opts.SymbolMatcher],
 	}
@@ -431,6 +443,10 @@ func (c *cmdClient) Progress(context.Context, *protocol.ProgressParams) error {
 	return nil
 }
 
+func (c *cmdClient) ShowDocument(context.Context, *protocol.ShowDocumentParams) (*protocol.ShowDocumentResult, error) {
+	return nil, nil
+}
+
 func (c *cmdClient) WorkDoneProgressCreate(context.Context, *protocol.WorkDoneProgressCreateParams) error {
 	return nil
 }
@@ -490,6 +506,15 @@ func (c *connection) AddFile(ctx context.Context, uri span.URI) *cmdFile {
 		file.err = errors.Errorf("%v: %v", uri, err)
 	}
 	return file
+}
+
+func (c *connection) semanticTokens(ctx context.Context, p *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
+	// use range to avoid limits on full
+	resp, err := c.Server.SemanticTokensRange(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (c *connection) diagnoseFiles(ctx context.Context, files []span.URI) error {

@@ -6,8 +6,6 @@ package source
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"go/ast"
 	"go/printer"
 	"go/token"
@@ -15,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/internal/lsp/protocol"
@@ -22,7 +21,9 @@ import (
 	errors "golang.org/x/xerrors"
 )
 
-type mappedRange struct {
+// MappedRange provides mapped protocol.Range for a span.Range, accounting for
+// UTF-16 code points.
+type MappedRange struct {
 	spanRange span.Range
 	m         *protocol.ColumnMapper
 
@@ -31,8 +32,9 @@ type mappedRange struct {
 	protocolRange *protocol.Range
 }
 
-func newMappedRange(fset *token.FileSet, m *protocol.ColumnMapper, start, end token.Pos) mappedRange {
-	return mappedRange{
+// NewMappedRange returns a MappedRange for the given start and end token.Pos.
+func NewMappedRange(fset *token.FileSet, m *protocol.ColumnMapper, start, end token.Pos) MappedRange {
+	return MappedRange{
 		spanRange: span.Range{
 			FileSet:   fset,
 			Start:     start,
@@ -43,7 +45,7 @@ func newMappedRange(fset *token.FileSet, m *protocol.ColumnMapper, start, end to
 	}
 }
 
-func (s mappedRange) Range() (protocol.Range, error) {
+func (s MappedRange) Range() (protocol.Range, error) {
 	if s.protocolRange == nil {
 		spn, err := s.spanRange.Span()
 		if err != nil {
@@ -58,70 +60,28 @@ func (s mappedRange) Range() (protocol.Range, error) {
 	return *s.protocolRange, nil
 }
 
-func (s mappedRange) Span() (span.Span, error) {
+func (s MappedRange) Span() (span.Span, error) {
 	return s.spanRange.Span()
 }
 
-func (s mappedRange) URI() span.URI {
+func (s MappedRange) SpanRange() span.Range {
+	return s.spanRange
+}
+
+func (s MappedRange) URI() span.URI {
 	return s.m.URI
 }
 
-// getParsedFile is a convenience function that extracts the Package and ParsedGoFile for a File in a Snapshot.
-// selectPackage is typically Narrowest/WidestPackageHandle below.
-func getParsedFile(ctx context.Context, snapshot Snapshot, fh FileHandle, selectPackage PackagePolicy) (Package, *ParsedGoFile, error) {
-	phs, err := snapshot.PackagesForFile(ctx, fh.URI())
-	if err != nil {
-		return nil, nil, err
-	}
-	pkg, err := selectPackage(phs)
+// GetParsedFile is a convenience function that extracts the Package and
+// ParsedGoFile for a file in a Snapshot. pkgPolicy is one of NarrowestPackage/
+// WidestPackage.
+func GetParsedFile(ctx context.Context, snapshot Snapshot, fh FileHandle, pkgPolicy PackageFilter) (Package, *ParsedGoFile, error) {
+	pkg, err := snapshot.PackageForFile(ctx, fh.URI(), TypecheckWorkspace, pkgPolicy)
 	if err != nil {
 		return nil, nil, err
 	}
 	pgh, err := pkg.File(fh.URI())
 	return pkg, pgh, err
-}
-
-type PackagePolicy func([]Package) (Package, error)
-
-// NarrowestPackage picks the "narrowest" package for a given file.
-//
-// By "narrowest" package, we mean the package with the fewest number of files
-// that includes the given file. This solves the problem of test variants,
-// as the test will have more files than the non-test package.
-func NarrowestPackage(pkgs []Package) (Package, error) {
-	if len(pkgs) < 1 {
-		return nil, errors.Errorf("no packages")
-	}
-	result := pkgs[0]
-	for _, handle := range pkgs[1:] {
-		if result == nil || len(handle.CompiledGoFiles()) < len(result.CompiledGoFiles()) {
-			result = handle
-		}
-	}
-	if result == nil {
-		return nil, errors.Errorf("no packages in input")
-	}
-	return result, nil
-}
-
-// WidestPackage returns the Package containing the most files.
-//
-// This is useful for something like diagnostics, where we'd prefer to offer diagnostics
-// for as many files as possible.
-func WidestPackage(pkgs []Package) (Package, error) {
-	if len(pkgs) < 1 {
-		return nil, errors.Errorf("no packages")
-	}
-	result := pkgs[0]
-	for _, handle := range pkgs[1:] {
-		if result == nil || len(handle.CompiledGoFiles()) > len(result.CompiledGoFiles()) {
-			result = handle
-		}
-	}
-	if result == nil {
-		return nil, errors.Errorf("no packages in input")
-	}
-	return result, nil
 }
 
 func IsGenerated(ctx context.Context, snapshot Snapshot, uri span.URI) bool {
@@ -158,7 +118,7 @@ func nodeToProtocolRange(snapshot Snapshot, pkg Package, n ast.Node) (protocol.R
 	return mrng.Range()
 }
 
-func objToMappedRange(snapshot Snapshot, pkg Package, obj types.Object) (mappedRange, error) {
+func objToMappedRange(snapshot Snapshot, pkg Package, obj types.Object) (MappedRange, error) {
 	if pkgName, ok := obj.(*types.PkgName); ok {
 		// An imported Go package has a package-local, unqualified name.
 		// When the name matches the imported package name, there is no
@@ -177,23 +137,23 @@ func objToMappedRange(snapshot Snapshot, pkg Package, obj types.Object) (mappedR
 	return nameToMappedRange(snapshot, pkg, obj.Pos(), obj.Name())
 }
 
-func nameToMappedRange(snapshot Snapshot, pkg Package, pos token.Pos, name string) (mappedRange, error) {
+func nameToMappedRange(snapshot Snapshot, pkg Package, pos token.Pos, name string) (MappedRange, error) {
 	return posToMappedRange(snapshot, pkg, pos, pos+token.Pos(len(name)))
 }
 
-func posToMappedRange(snapshot Snapshot, pkg Package, pos, end token.Pos) (mappedRange, error) {
+func posToMappedRange(snapshot Snapshot, pkg Package, pos, end token.Pos) (MappedRange, error) {
 	logicalFilename := snapshot.FileSet().File(pos).Position(pos).Filename
 	pgf, _, err := findFileInDeps(pkg, span.URIFromPath(logicalFilename))
 	if err != nil {
-		return mappedRange{}, err
+		return MappedRange{}, err
 	}
 	if !pos.IsValid() {
-		return mappedRange{}, errors.Errorf("invalid position for %v", pos)
+		return MappedRange{}, errors.Errorf("invalid position for %v", pos)
 	}
 	if !end.IsValid() {
-		return mappedRange{}, errors.Errorf("invalid position for %v", end)
+		return MappedRange{}, errors.Errorf("invalid position for %v", end)
 	}
-	return newMappedRange(snapshot.FileSet(), pgf.Mapper, pos, end), nil
+	return NewMappedRange(snapshot.FileSet(), pgf.Mapper, pos, end), nil
 }
 
 // Matches cgo generated comment as well as the proposed standard:
@@ -208,14 +168,21 @@ func DetectLanguage(langID, filename string) FileKind {
 		return Mod
 	case "go.sum":
 		return Sum
+	case "tmpl":
+		return Tmpl
 	}
 	// Fallback to detecting the language based on the file extension.
-	switch filepath.Ext(filename) {
+	switch ext := filepath.Ext(filename); ext {
 	case ".mod":
 		return Mod
 	case ".sum":
 		return Sum
-	default: // fallback to Go
+	default:
+		if strings.HasSuffix(ext, "tmpl") {
+			// .tmpl, .gotmpl, etc
+			return Tmpl
+		}
+		// It's a Go file, or we shouldn't be seeing it
 		return Go
 	}
 }
@@ -226,12 +193,15 @@ func (k FileKind) String() string {
 		return "go.mod"
 	case Sum:
 		return "go.sum"
+	case Tmpl:
+		return "tmpl"
 	default:
 		return "go"
 	}
 }
 
-// Returns the index and the node whose position is contained inside the node list.
+// nodeAtPos returns the index and the node whose position is contained inside
+// the node list.
 func nodeAtPos(nodes []ast.Node, pos token.Pos) (ast.Node, int) {
 	if nodes == nil {
 		return nil, -1
@@ -244,121 +214,13 @@ func nodeAtPos(nodes []ast.Node, pos token.Pos) (ast.Node, int) {
 	return nil, -1
 }
 
-// indexExprAtPos returns the index of the expression containing pos.
-func exprAtPos(pos token.Pos, args []ast.Expr) int {
-	for i, expr := range args {
-		if expr.Pos() <= pos && pos <= expr.End() {
-			return i
-		}
-	}
-	return len(args)
+// IsInterface returns if a types.Type is an interface
+func IsInterface(T types.Type) bool {
+	return T != nil && types.IsInterface(T)
 }
 
-// eachField invokes fn for each field that can be selected from a
-// value of type T.
-func eachField(T types.Type, fn func(*types.Var)) {
-	// TODO(adonovan): this algorithm doesn't exclude ambiguous
-	// selections that match more than one field/method.
-	// types.NewSelectionSet should do that for us.
-
-	// for termination on recursive types
-	var seen map[*types.Struct]bool
-
-	var visit func(T types.Type)
-	visit = func(T types.Type) {
-		if T, ok := deref(T).Underlying().(*types.Struct); ok {
-			if seen[T] {
-				return
-			}
-
-			for i := 0; i < T.NumFields(); i++ {
-				f := T.Field(i)
-				fn(f)
-				if f.Anonymous() {
-					if seen == nil {
-						// Lazily create "seen" since it is only needed for
-						// embedded structs.
-						seen = make(map[*types.Struct]bool)
-					}
-					seen[T] = true
-					visit(f.Type())
-				}
-			}
-		}
-	}
-	visit(T)
-}
-
-// typeIsValid reports whether typ doesn't contain any Invalid types.
-func typeIsValid(typ types.Type) bool {
-	// Check named types separately, because we don't want
-	// to call Underlying() on them to avoid problems with recursive types.
-	if _, ok := typ.(*types.Named); ok {
-		return true
-	}
-
-	switch typ := typ.Underlying().(type) {
-	case *types.Basic:
-		return typ.Kind() != types.Invalid
-	case *types.Array:
-		return typeIsValid(typ.Elem())
-	case *types.Slice:
-		return typeIsValid(typ.Elem())
-	case *types.Pointer:
-		return typeIsValid(typ.Elem())
-	case *types.Map:
-		return typeIsValid(typ.Key()) && typeIsValid(typ.Elem())
-	case *types.Chan:
-		return typeIsValid(typ.Elem())
-	case *types.Signature:
-		return typeIsValid(typ.Params()) && typeIsValid(typ.Results())
-	case *types.Tuple:
-		for i := 0; i < typ.Len(); i++ {
-			if !typeIsValid(typ.At(i).Type()) {
-				return false
-			}
-		}
-		return true
-	case *types.Struct, *types.Interface:
-		// Don't bother checking structs, interfaces for validity.
-		return true
-	default:
-		return false
-	}
-}
-
-// resolveInvalid traverses the node of the AST that defines the scope
-// containing the declaration of obj, and attempts to find a user-friendly
-// name for its invalid type. The resulting Object and its Type are fake.
-func resolveInvalid(fset *token.FileSet, obj types.Object, node ast.Node, info *types.Info) types.Object {
-	var resultExpr ast.Expr
-	ast.Inspect(node, func(node ast.Node) bool {
-		switch n := node.(type) {
-		case *ast.ValueSpec:
-			for _, name := range n.Names {
-				if info.Defs[name] == obj {
-					resultExpr = n.Type
-				}
-			}
-			return false
-		case *ast.Field: // This case handles parameters and results of a FuncDecl or FuncLit.
-			for _, name := range n.Names {
-				if info.Defs[name] == obj {
-					resultExpr = n.Type
-				}
-			}
-			return false
-		default:
-			return true
-		}
-	})
-	// Construct a fake type for the object and return a fake object with this type.
-	typename := formatNode(fset, resultExpr)
-	typ := types.NewNamed(types.NewTypeName(token.NoPos, obj.Pkg(), typename, nil), types.Typ[types.Invalid], nil)
-	return types.NewVar(obj.Pos(), obj.Pkg(), obj.Name(), typ)
-}
-
-func formatNode(fset *token.FileSet, n ast.Node) string {
+// FormatNode returns the "pretty-print" output for an ast node.
+func FormatNode(fset *token.FileSet, n ast.Node) string {
 	var buf strings.Builder
 	if err := printer.Fprint(&buf, fset, n); err != nil {
 		return ""
@@ -366,127 +228,28 @@ func formatNode(fset *token.FileSet, n ast.Node) string {
 	return buf.String()
 }
 
-func isPointer(T types.Type) bool {
-	_, ok := T.(*types.Pointer)
-	return ok
-}
-
-func isVar(obj types.Object) bool {
-	_, ok := obj.(*types.Var)
-	return ok
-}
-
-// deref returns a pointer's element type, traversing as many levels as needed.
+// Deref returns a pointer's element type, traversing as many levels as needed.
 // Otherwise it returns typ.
-func deref(typ types.Type) types.Type {
+//
+// It can return a pointer type for cyclic types (see golang/go#45510).
+func Deref(typ types.Type) types.Type {
+	var seen map[types.Type]struct{}
 	for {
 		p, ok := typ.Underlying().(*types.Pointer)
 		if !ok {
 			return typ
 		}
+		if _, ok := seen[p.Elem()]; ok {
+			return typ
+		}
+
 		typ = p.Elem()
-	}
-}
 
-func isTypeName(obj types.Object) bool {
-	_, ok := obj.(*types.TypeName)
-	return ok
-}
-
-func isFunc(obj types.Object) bool {
-	_, ok := obj.(*types.Func)
-	return ok
-}
-
-func isEmptyInterface(T types.Type) bool {
-	intf, _ := T.(*types.Interface)
-	return intf != nil && intf.NumMethods() == 0
-}
-
-func isUntyped(T types.Type) bool {
-	if basic, ok := T.(*types.Basic); ok {
-		return basic.Info()&types.IsUntyped > 0
-	}
-	return false
-}
-
-func isPkgName(obj types.Object) bool {
-	_, ok := obj.(*types.PkgName)
-	return ok
-}
-
-func isASTFile(n ast.Node) bool {
-	_, ok := n.(*ast.File)
-	return ok
-}
-
-func deslice(T types.Type) types.Type {
-	if slice, ok := T.Underlying().(*types.Slice); ok {
-		return slice.Elem()
-	}
-	return nil
-}
-
-// isSelector returns the enclosing *ast.SelectorExpr when pos is in the
-// selector.
-func enclosingSelector(path []ast.Node, pos token.Pos) *ast.SelectorExpr {
-	if len(path) == 0 {
-		return nil
-	}
-
-	if sel, ok := path[0].(*ast.SelectorExpr); ok {
-		return sel
-	}
-
-	if _, ok := path[0].(*ast.Ident); ok && len(path) > 1 {
-		if sel, ok := path[1].(*ast.SelectorExpr); ok && pos >= sel.Sel.Pos() {
-			return sel
+		if seen == nil {
+			seen = make(map[types.Type]struct{})
 		}
+		seen[typ] = struct{}{}
 	}
-
-	return nil
-}
-
-func enclosingValueSpec(path []ast.Node) *ast.ValueSpec {
-	for _, n := range path {
-		if vs, ok := n.(*ast.ValueSpec); ok {
-			return vs
-		}
-	}
-
-	return nil
-}
-
-// typeConversion returns the type being converted to if call is a type
-// conversion expression.
-func typeConversion(call *ast.CallExpr, info *types.Info) types.Type {
-	var ident *ast.Ident
-	switch expr := call.Fun.(type) {
-	case *ast.Ident:
-		ident = expr
-	case *ast.SelectorExpr:
-		ident = expr.Sel
-	default:
-		return nil
-	}
-
-	// Type conversion (e.g. "float64(foo)").
-	if fun, _ := info.ObjectOf(ident).(*types.TypeName); fun != nil {
-		return fun.Type()
-	}
-
-	return nil
-}
-
-// fieldsAccessible returns whether s has at least one field accessible by p.
-func fieldsAccessible(s *types.Struct, p *types.Package) bool {
-	for i := 0; i < s.NumFields(); i++ {
-		f := s.Field(i)
-		if f.Exported() || f.Pkg() == p {
-			return true
-		}
-	}
-	return false
 }
 
 func SortDiagnostics(d []*Diagnostic) {
@@ -511,18 +274,19 @@ func CompareDiagnostic(a, b *Diagnostic) int {
 	return 1
 }
 
-func findPosInPackage(snapshot Snapshot, searchpkg Package, pos token.Pos) (*ParsedGoFile, Package, error) {
+// FindPackageFromPos finds the parsed file for a position in a given search
+// package.
+func FindPackageFromPos(ctx context.Context, snapshot Snapshot, pos token.Pos) (Package, error) {
 	tok := snapshot.FileSet().File(pos)
 	if tok == nil {
-		return nil, nil, errors.Errorf("no file for pos in package %s", searchpkg.ID())
+		return nil, errors.Errorf("no file for pos %v", pos)
 	}
 	uri := span.URIFromPath(tok.Name())
-
-	pgf, pkg, err := findFileInDeps(searchpkg, uri)
+	pkgs, err := snapshot.PackagesForFile(ctx, uri, TypecheckWorkspace)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return pgf, pkg, nil
+	return pkgs[0], nil
 }
 
 // findFileInDeps finds uri in pkg or its dependencies.
@@ -547,96 +311,220 @@ func findFileInDeps(pkg Package, uri span.URI) (*ParsedGoFile, Package, error) {
 	return nil, nil, errors.Errorf("no file for %s in package %s", uri, pkg.ID())
 }
 
-// prevStmt returns the statement that precedes the statement containing pos.
-// For example:
-//
-//     foo := 1
-//     bar(1 + 2<>)
-//
-// If "<>" is pos, prevStmt returns "foo := 1"
-func prevStmt(pos token.Pos, path []ast.Node) ast.Stmt {
-	var blockLines []ast.Stmt
-	for i := 0; i < len(path) && blockLines == nil; i++ {
-		switch n := path[i].(type) {
-		case *ast.BlockStmt:
-			blockLines = n.List
-		case *ast.CommClause:
-			blockLines = n.Body
-		case *ast.CaseClause:
-			blockLines = n.Body
-		}
+// ImportPath returns the unquoted import path of s,
+// or "" if the path is not properly quoted.
+func ImportPath(s *ast.ImportSpec) string {
+	t, err := strconv.Unquote(s.Path.Value)
+	if err != nil {
+		return ""
 	}
-
-	for i := len(blockLines) - 1; i >= 0; i-- {
-		if blockLines[i].End() < pos {
-			return blockLines[i]
-		}
-	}
-
-	return nil
+	return t
 }
 
-// formatZeroValue produces Go code representing the zero value of T.
-func formatZeroValue(T types.Type, qf types.Qualifier) string {
-	switch u := T.Underlying().(type) {
-	case *types.Basic:
-		switch {
-		case u.Info()&types.IsNumeric > 0:
-			return "0"
-		case u.Info()&types.IsString > 0:
-			return `""`
-		case u.Info()&types.IsBoolean > 0:
-			return "false"
-		default:
-			panic(fmt.Sprintf("unhandled basic type: %v", u))
+// NodeContains returns true if a node encloses a given position pos.
+func NodeContains(n ast.Node, pos token.Pos) bool {
+	return n != nil && n.Pos() <= pos && pos <= n.End()
+}
+
+// CollectScopes returns all scopes in an ast path, ordered as innermost scope
+// first.
+func CollectScopes(info *types.Info, path []ast.Node, pos token.Pos) []*types.Scope {
+	// scopes[i], where i<len(path), is the possibly nil Scope of path[i].
+	var scopes []*types.Scope
+	for _, n := range path {
+		// Include *FuncType scope if pos is inside the function body.
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			if node.Body != nil && NodeContains(node.Body, pos) {
+				n = node.Type
+			}
+		case *ast.FuncLit:
+			if node.Body != nil && NodeContains(node.Body, pos) {
+				n = node.Type
+			}
 		}
-	case *types.Pointer, *types.Interface, *types.Chan, *types.Map, *types.Slice, *types.Signature:
-		return "nil"
+		scopes = append(scopes, info.Scopes[n])
+	}
+	return scopes
+}
+
+// Qualifier returns a function that appropriately formats a types.PkgName
+// appearing in a *ast.File.
+func Qualifier(f *ast.File, pkg *types.Package, info *types.Info) types.Qualifier {
+	// Construct mapping of import paths to their defined or implicit names.
+	imports := make(map[*types.Package]string)
+	for _, imp := range f.Imports {
+		var obj types.Object
+		if imp.Name != nil {
+			obj = info.Defs[imp.Name]
+		} else {
+			obj = info.Implicits[imp]
+		}
+		if pkgname, ok := obj.(*types.PkgName); ok {
+			imports[pkgname.Imported()] = pkgname.Name()
+		}
+	}
+	// Define qualifier to replace full package paths with names of the imports.
+	return func(p *types.Package) string {
+		if p == pkg {
+			return ""
+		}
+		if name, ok := imports[p]; ok {
+			if name == "." {
+				return ""
+			}
+			return name
+		}
+		return p.Name()
+	}
+}
+
+// isDirective reports whether c is a comment directive.
+//
+// Copied and adapted from go/src/go/ast/ast.go.
+func isDirective(c string) bool {
+	if len(c) < 3 {
+		return false
+	}
+	if c[1] != '/' {
+		return false
+	}
+	//-style comment (no newline at the end)
+	c = c[2:]
+	if len(c) == 0 {
+		// empty line
+		return false
+	}
+	// "//line " is a line directive.
+	// (The // has been removed.)
+	if strings.HasPrefix(c, "line ") {
+		return true
+	}
+
+	// "//[a-z0-9]+:[a-z0-9]"
+	// (The // has been removed.)
+	colon := strings.Index(c, ":")
+	if colon <= 0 || colon+1 >= len(c) {
+		return false
+	}
+	for i := 0; i <= colon+1; i++ {
+		if i == colon {
+			continue
+		}
+		b := c[i]
+		if !('a' <= b && b <= 'z' || '0' <= b && b <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// honorSymlinks toggles whether or not we consider symlinks when comparing
+// file or directory URIs.
+const honorSymlinks = false
+
+func CompareURI(left, right span.URI) int {
+	if honorSymlinks {
+		return span.CompareURI(left, right)
+	}
+	if left == right {
+		return 0
+	}
+	if left < right {
+		return -1
+	}
+	return 1
+}
+
+// InDir checks whether path is in the file tree rooted at dir.
+// InDir makes some effort to succeed even in the presence of symbolic links.
+//
+// Copied and slightly adjusted from go/src/cmd/go/internal/search/search.go.
+func InDir(dir, path string) bool {
+	if inDirLex(dir, path) {
+		return true
+	}
+	if !honorSymlinks {
+		return false
+	}
+	xpath, err := filepath.EvalSymlinks(path)
+	if err != nil || xpath == path {
+		xpath = ""
+	} else {
+		if inDirLex(dir, xpath) {
+			return true
+		}
+	}
+
+	xdir, err := filepath.EvalSymlinks(dir)
+	if err == nil && xdir != dir {
+		if inDirLex(xdir, path) {
+			return true
+		}
+		if xpath != "" {
+			if inDirLex(xdir, xpath) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// inDirLex is like inDir but only checks the lexical form of the file names.
+// It does not consider symbolic links.
+//
+// Copied from go/src/cmd/go/internal/search/search.go.
+func inDirLex(dir, path string) bool {
+	pv := strings.ToUpper(filepath.VolumeName(path))
+	dv := strings.ToUpper(filepath.VolumeName(dir))
+	path = path[len(pv):]
+	dir = dir[len(dv):]
+	switch {
 	default:
-		return types.TypeString(T, qf) + "{}"
+		return false
+	case pv != dv:
+		return false
+	case len(path) == len(dir):
+		if path == dir {
+			return true
+		}
+		return false
+	case dir == "":
+		return path != ""
+	case len(path) > len(dir):
+		if dir[len(dir)-1] == filepath.Separator {
+			if path[:len(dir)] == dir {
+				return path[len(dir):] != ""
+			}
+			return false
+		}
+		if path[len(dir)] == filepath.Separator && path[:len(dir)] == dir {
+			if len(path) == len(dir)+1 {
+				return true
+			}
+			return path[len(dir)+1:] != ""
+		}
+		return false
 	}
 }
 
-// MarshalArgs encodes the given arguments to json.RawMessages. This function
-// is used to construct arguments to a protocol.Command.
-//
-// Example usage:
-//
-//   jsonArgs, err := EncodeArgs(1, "hello", true, StructuredArg{42, 12.6})
-//
-func MarshalArgs(args ...interface{}) ([]json.RawMessage, error) {
-	var out []json.RawMessage
-	for _, arg := range args {
-		argJSON, err := json.Marshal(arg)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, argJSON)
+// IsValidImport returns whether importPkgPath is importable
+// by pkgPath
+func IsValidImport(pkgPath, importPkgPath string) bool {
+	i := strings.LastIndex(string(importPkgPath), "/internal/")
+	if i == -1 {
+		return true
 	}
-	return out, nil
+	if IsCommandLineArguments(string(pkgPath)) {
+		return true
+	}
+	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
 }
 
-// UnmarshalArgs decodes the given json.RawMessages to the variables provided
-// by args. Each element of args should be a pointer.
-//
-// Example usage:
-//
-//   var (
-//       num int
-//       str string
-//       bul bool
-//       structured StructuredArg
-//   )
-//   err := UnmarshalArgs(args, &num, &str, &bul, &structured)
-//
-func UnmarshalArgs(jsonArgs []json.RawMessage, args ...interface{}) error {
-	if len(args) != len(jsonArgs) {
-		return fmt.Errorf("DecodeArgs: expected %d input arguments, got %d JSON arguments", len(args), len(jsonArgs))
-	}
-	for i, arg := range args {
-		if err := json.Unmarshal(jsonArgs[i], arg); err != nil {
-			return err
-		}
-	}
-	return nil
+// IsCommandLineArguments reports whether a given value denotes
+// "command-line-arguments" package, which is a package with an unknown ID
+// created by the go command. It can have a test variant, which is why callers
+// should not check that a value equals "command-line-arguments" directly.
+func IsCommandLineArguments(s string) bool {
+	return strings.Contains(s, "command-line-arguments")
 }

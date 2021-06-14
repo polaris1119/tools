@@ -25,13 +25,13 @@ import (
 	"flag"
 	"fmt"
 	"go/build"
+	exec "golang.org/x/sys/execabs"
 	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof" // to serve /debug/pprof/*
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -192,8 +192,10 @@ func main() {
 	}
 	if *templateDir != "" {
 		fs.Bind("/lib/godoc", vfs.OS(*templateDir), "/", vfs.BindBefore)
+		fs.Bind("/favicon.ico", vfs.OS(*templateDir), "/favicon.ico", vfs.BindReplace)
 	} else {
 		fs.Bind("/lib/godoc", mapfs.New(static.Files), "/", vfs.BindReplace)
+		fs.Bind("/favicon.ico", mapfs.New(static.Files), "/favicon.ico", vfs.BindReplace)
 	}
 
 	// Get the GOMOD value, use it to determine if godoc is being invoked in module mode.

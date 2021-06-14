@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package lsp
 
 import (
@@ -14,11 +18,10 @@ func (r *runner) Completion(t *testing.T, src span.Span, test tests.Completion, 
 	got := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.DeepCompletion = false
 		opts.Matcher = source.CaseInsensitive
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
 		opts.InsertTextFormat = protocol.SnippetTextFormat
-		if !strings.Contains(string(src.URI()), "literal") {
-			opts.LiteralCompletions = false
-		}
+		opts.LiteralCompletions = strings.Contains(string(src.URI()), "literal")
+		opts.ExperimentalPostfixCompletions = strings.Contains(string(src.URI()), "postfix")
 	})
 	got = tests.FilterBuiltins(src, got)
 	want := expected(t, test, items)
@@ -29,10 +32,10 @@ func (r *runner) Completion(t *testing.T, src span.Span, test tests.Completion, 
 
 func (r *runner) CompletionSnippet(t *testing.T, src span.Span, expected tests.CompletionSnippet, placeholders bool, items tests.CompletionItems) {
 	list := r.callCompletion(t, src, func(opts *source.Options) {
-		opts.Placeholders = placeholders
+		opts.UsePlaceholders = placeholders
 		opts.DeepCompletion = true
 		opts.Matcher = source.Fuzzy
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
 	})
 	got := tests.FindItem(list, *items[expected.CompletionItem])
 	want := expected.PlainSnippet
@@ -57,7 +60,7 @@ func (r *runner) DeepCompletion(t *testing.T, src span.Span, test tests.Completi
 	got := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.DeepCompletion = true
 		opts.Matcher = source.CaseInsensitive
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
 	})
 	got = tests.FilterBuiltins(src, got)
 	want := expected(t, test, items)
@@ -70,7 +73,7 @@ func (r *runner) FuzzyCompletion(t *testing.T, src span.Span, test tests.Complet
 	got := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.DeepCompletion = true
 		opts.Matcher = source.Fuzzy
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
 	})
 	got = tests.FilterBuiltins(src, got)
 	want := expected(t, test, items)
@@ -82,7 +85,7 @@ func (r *runner) FuzzyCompletion(t *testing.T, src span.Span, test tests.Complet
 func (r *runner) CaseSensitiveCompletion(t *testing.T, src span.Span, test tests.Completion, items tests.CompletionItems) {
 	got := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.Matcher = source.CaseSensitive
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
 	})
 	got = tests.FilterBuiltins(src, got)
 	want := expected(t, test, items)
@@ -95,7 +98,9 @@ func (r *runner) RankCompletion(t *testing.T, src span.Span, test tests.Completi
 	got := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.DeepCompletion = true
 		opts.Matcher = source.Fuzzy
-		opts.UnimportedCompletion = false
+		opts.CompleteUnimported = false
+		opts.LiteralCompletions = true
+		opts.ExperimentalPostfixCompletions = true
 	})
 	want := expected(t, test, items)
 	if msg := tests.CheckCompletionOrder(want, got, true); msg != "" {
@@ -122,8 +127,8 @@ func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*sourc
 		t.Fatal(err)
 	}
 	original := view.Options()
-	modified := original
-	options(&modified)
+	modified := view.Options().Clone()
+	options(modified)
 	view, err = view.SetOptions(r.ctx, modified)
 	if err != nil {
 		t.Error(err)
@@ -137,8 +142,8 @@ func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*sourc
 				URI: protocol.URIFromSpanURI(src.URI()),
 			},
 			Position: protocol.Position{
-				Line:      float64(src.Start().Line() - 1),
-				Character: float64(src.Start().Column() - 1),
+				Line:      uint32(src.Start().Line() - 1),
+				Character: uint32(src.Start().Column() - 1),
 			},
 		},
 	})

@@ -163,6 +163,7 @@ func (modules) Finalize(exported *Exported) error {
 	exported.Config.Env = append(exported.Config.Env,
 		"GO111MODULE=on",
 		"GOPATH="+filepath.Join(exported.temp, "modcache"),
+		"GOMODCACHE=",
 		"GOPROXY="+proxydir.ToURL(modProxyDir),
 		"GOSUMDB=off",
 	)
@@ -173,7 +174,7 @@ func (modules) Finalize(exported *Exported) error {
 	// stuff in cache. All the files created by Export should be recreated.
 	inv := gocommand.Invocation{
 		Verb:       "mod",
-		Args:       []string{"download"},
+		Args:       []string{"download", "all"},
 		Env:        exported.Config.Env,
 		BuildFlags: exported.Config.BuildFlags,
 		WorkingDir: exported.Config.Dir,
